@@ -32,12 +32,6 @@ cd batch-finder
 pip install -e .
 ```
 
-For HuggingFace models:
-
-```bash
-pip install batch-finder[transformers]
-```
-
 ## 🚀 Quick Start
 
 ### Mode 1: `input_shape` (single-input models)
@@ -79,6 +73,19 @@ max_batch = find_max_minibatch(
 print(f"Max batch size: {max_batch}")
 ```
 
+### Custom search parameters
+
+```python
+max_val = find_max_minibatch(
+    model=model,
+    input_shape=(-1, 128, 512),
+    initial_value=8,
+    n_attempts=30,
+    factor_down=3.0,   # divide by 3 on failure
+    factor_up=2.0,     # multiply by 2 on success
+)
+```
+
 ## 📖 API Reference
 
 ### `find_max_minibatch(model, ...)`
@@ -114,56 +121,6 @@ Find the maximum value for the modifiable axis without OOM.
 3. **Shape estimation** – From model (Linear.in_features, config, etc.) and param-name conventions.
 4. **Search** – On success: try `value * factor_up`. On failure: try `value / factor_down`. Stops when value 1 fails or `n_attempts` reached.
 5. **Loss** – Uses `output.loss` if present, else sum of all output tensors.
-
-## 💡 Examples
-
-### PyTorch model with `input_shape`
-
-```python
-import torch.nn as nn
-from batch_finder import find_max_minibatch
-
-class SimpleModel(nn.Module):
-    def forward(self, x):
-        return self.linear(x)  # x: (batch, seq, hidden)
-
-model = SimpleModel()
-max_batch = find_max_minibatch(
-    model=model,
-    input_shape=(-1, 64, 256),
-    initial_value=64,
-    inference_only=True,
-)
-```
-
-### HuggingFace model
-
-```python
-from transformers import AutoModelForCausalLM
-from batch_finder import find_max_minibatch
-
-model = AutoModelForCausalLM.from_pretrained("distilgpt2")
-max_batch = find_max_minibatch(
-    model=model,
-    axis_to_maximize="batch_size",
-    fixed_dims={"seq_len": 32},
-    initial_value=32,
-    inference_only=False,  # full forward+backward for training
-)
-```
-
-### Custom search parameters
-
-```python
-max_val = find_max_minibatch(
-    model=model,
-    input_shape=(-1, 128, 512),
-    initial_value=8,
-    n_attempts=30,
-    factor_down=3.0,   # divide by 3 on failure
-    factor_up=2.0,     # multiply by 2 on success
-)
-```
 
 ## ⚠️ Important Notes
 
