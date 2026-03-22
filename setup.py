@@ -31,6 +31,7 @@ setup(
         "tqdm>=4.60.0",
     ],
     extras_require={
+        "transformers": ["transformers>=4.0.0"],
         "dev": [
             "pytest>=6.0",
             "black>=21.0",

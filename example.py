@@ -4,100 +4,70 @@ Example usage of batch_finder package.
 
 import torch
 import torch.nn as nn
-from batch_finder import batch_finder, find_max_batch, find_max_docs, find_max_timesteps
+from batch_finder import find_max_minibatch
 
 
-# Example 1: Simple model
+# Example 1: Small PyTorch model
+# Accepts (a,b), (a,b,c), (a,b,c,d) - flexible last dim for -1 in any position
 class SimpleModel(nn.Module):
-    def __init__(self, hidden_size=768):
+    def __init__(self):
         super().__init__()
-        self.linear = nn.Linear(hidden_size, hidden_size)
         self.activation = nn.ReLU()
-    
+        self._linears = nn.ModuleDict()
+
+    def _get_linear(self, in_features: int, device):
+        key = str(in_features)
+        if key not in self._linears:
+            self._linears[key] = nn.Linear(in_features, in_features).to(device)
+        return self._linears[key]
+
     def forward(self, x):
-        # x: (batch_size, seq_len, hidden_size)
-        return self.activation(self.linear(x))
-
-
-# Example 2: RAG Model
-class RAGModel(nn.Module):
-    def __init__(self, vocab_size=50257, hidden_size=768):
-        super().__init__()
-        self.embedding = nn.Embedding(vocab_size, hidden_size)
-        self.transformer = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(hidden_size, nhead=8),
-            num_layers=6
-        )
-        self.config = type('Config', (), {'vocab_size': vocab_size, 'hidden_size': hidden_size})()
-    
-    def forward(self, input_ids, input_ids_encoder=None, **kwargs):
-        # input_ids: (batch_size, seq_len)
-        # input_ids_encoder: (n_docs, batch_size, seq_len)
-        batch_emb = self.embedding(input_ids)
-        
-        if input_ids_encoder is not None:
-            # Process encoder docs
-            n_docs, batch_size, seq_len = input_ids_encoder.shape
-            docs_emb = self.embedding(input_ids_encoder.view(-1, seq_len))
-            docs_emb = docs_emb.view(n_docs, batch_size, seq_len, -1)
-            # Simple aggregation: mean over docs
-            docs_emb = docs_emb.mean(dim=0)
-            batch_emb = batch_emb + docs_emb
-        
-        output = self.transformer(batch_emb.transpose(0, 1))
-        return {'logits': output.transpose(0, 1)}
+        in_features = x.shape[-1]
+        linear = self._get_linear(in_features, x.device)
+        return self.activation(linear(x))
 
 
 if __name__ == "__main__":
-    print("="*60)
+    print("=" * 60)
     print("Batch Finder Examples")
-    print("="*60)
-    
-    # Example 1: Find max batch size
-    print("\n1. Finding max batch size for SimpleModel...")
-    model1 = SimpleModel()
-    max_batch = find_max_batch(
-        model=model1,
-        input_shape=(128, 768),
-        max_batch_size=32,
-        inference_only=True
-    )
-    print(f"   Result: Max batch size = {max_batch}")
-    
-    # Example 2: Find max docs for RAG model
-    print("\n2. Finding max docs for RAGModel...")
-    model2 = RAGModel()
-    max_docs = find_max_docs(
-        model=model2,
-        batch_size=4,
-        seq_len=128,
-        max_docs=50,
-        inference_only=True
-    )
-    print(f"   Result: Max docs = {max_docs}")
-    
-    # Example 3: Find max timesteps
-    print("\n3. Finding max timesteps for SimpleModel...")
-    max_timesteps = find_max_timesteps(
-        model=model1,
-        batch_size=4,
-        max_timesteps=512,
-        inference_only=True
-    )
-    print(f"   Result: Max timesteps = {max_timesteps}")
-    
-    # Example 4: Find all at once
-    print("\n4. Finding all maximums for SimpleModel...")
-    results = batch_finder(
-        model=model1,
-        batch_size_range=(1, 32),
-        docs_range=(1, 20),
-        timesteps_range=(64, 256),
-        inference_only=True
-    )
-    print(f"   Results: {results}")
-    
-    print("\n" + "="*60)
-    print("Examples completed!")
-    print("="*60)
+    print("=" * 60)
 
+    n_attempts = 50  # Number of attempts for each test case to find max batch size
+    model1 = SimpleModel()
+
+    # 1a: (a, b, -1) - fixed a,b, maximize last axis
+    print("\n1a. SimpleModel input_shape=(4, 8, -1)...")
+    max_1a = find_max_minibatch(model=model1, input_shape=(4, 8, -1), initial_value=64, inference_only=False, n_attempts=n_attempts)
+    print(f"   Result: Max = {max_1a}")
+
+    # 1b: (-1, b, c, d) - maximize axis 0
+    print("\n1b. SimpleModel input_shape=(-1, 4, 8, 16)...")
+    max_1b = find_max_minibatch(model=model1, input_shape=(-1, 4, 8, 16), initial_value=64, inference_only=True, n_attempts=n_attempts)
+    print(f"   Result: Max = {max_1b}")
+
+    # 1c: (-1, b, -1, d) - maximize axes 0 and 2 (same value)
+    print("\n1c. SimpleModel input_shape=(-1, 4, -1, 16)...")
+    max_1c = find_max_minibatch(model=model1, input_shape=(-1, 4, -1, 16), initial_value=32, inference_only=True, n_attempts=n_attempts)
+    print(f"   Result: Max = {max_1c}")
+
+    # Example 2: Small HuggingFace model (requires: pip install transformers)
+    try:
+        from transformers import AutoModelForCausalLM
+
+        print("\n2. HuggingFace model (distilgpt2)...")
+        model2 = AutoModelForCausalLM.from_pretrained("distilgpt2")
+        max_batch_hf = find_max_minibatch(
+            model=model2,
+            axis_to_maximize="batch_size",
+            fixed_dims={"seq_len": 32},
+            initial_value=32,
+            inference_only=False,
+            n_attempts=n_attempts,
+        )
+        print(f"   Result: Max batch_size = {max_batch_hf}")
+    except ImportError:
+        print("\n2. Skipping HF example (pip install transformers to enable)")
+
+    print("\n" + "=" * 60)
+    print("Examples completed!")
+    print("=" * 60)

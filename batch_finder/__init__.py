@@ -6,11 +6,11 @@ and sequence length (timesteps) that your model can handle without running out o
 """
 
 from .batch_finder import (
-    find_max_batch
+    find_max_minibatch
 )
 
 __version__ = "0.1.0"
 __all__ = [
-    "find_max_batch",
+    "find_max_minibatch",
 ]
 
