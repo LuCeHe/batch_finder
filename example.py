@@ -30,7 +30,7 @@ class SimpleModel(nn.Module):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Batch Finder Examples")
-    parser.add_argument("--n-attempts", "-n", type=int, default=5, help="Max attempts per test (default: 50)")
+    parser.add_argument("--n-attempts", "-n", type=int, default=2, help="Max attempts per test (default: 50)")
     args = parser.parse_args()
 
     print("=" * 60)

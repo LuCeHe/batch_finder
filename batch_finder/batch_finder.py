@@ -3,6 +3,7 @@ Batch Finder - Core functionality for finding maximum batch sizes along variable
 """
 
 import inspect
+import logging
 import sys
 import time
 import warnings
@@ -298,12 +299,20 @@ def find_max_minibatch(
     desc_base = f"shape={input_shape}" if use_input_shape else f"{axis_to_maximize} fixed={fixed_dims}"
     pbar = tqdm(range(n_attempts), total=n_attempts, desc=desc_base, position=0, leave=True)
     captured_warnings: List[str] = []
+    _log_records: List[logging.LogRecord] = []
+
+    class _CaptureHandler(logging.Handler):
+        def emit(self, record: logging.LogRecord):
+            _log_records.append(record)
+
+    _log_handler = _CaptureHandler()
     successful: List[int] = []
     unsuccessful: List[int] = []
     current_value = initial_value
 
-    # Subprocess + fork breaks CUDA context in child. Use in-process when GPU.
-    use_subprocess = sys.platform != "win32" and not torch.cuda.is_available()
+    # Use subprocess on Linux for OOM protection. Spawn (not fork) to avoid broken CUDA context.
+    use_subprocess = sys.platform != "win32"
+    mp_ctx = multiprocessing.get_context("spawn") if use_subprocess else None
     first_subprocess_run = True
     n_gpus = 0
     for i in pbar:
@@ -312,25 +321,42 @@ def find_max_minibatch(
         err_msg_str: Optional[str] = None
         n_gpus = 0
 
-        if use_subprocess:
-            result_queue = multiprocessing.Queue()
+        if use_subprocess and mp_ctx:
+            result_queue = mp_ctx.Queue()
 
             def run_in_process(q, v: int, show_gpu: bool = True):
-                gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
-                if show_gpu:
-                    gpu_info = f"CUDA available: {torch.cuda.is_available()}"
-                    if torch.cuda.is_available():
-                        gpu_info += f", devices: {gpus}"
-                    tqdm.write(f"[subprocess] {gpu_info}")
-                with warnings.catch_warnings(record=True) as w:
-                    warnings.simplefilter("always")
-                    try:
-                        forward_and_backward(v)
-                        q.put((True, None, gpus, [str(x.message) for x in w]))
-                    except Exception as e:
-                        q.put((False, str(e)[:60], gpus, [str(x.message) for x in w]))
+                log_msgs: List[str] = []
 
-            proc = multiprocessing.Process(target=run_in_process, args=(result_queue, value_i, first_subprocess_run))
+                class _QHandler(logging.Handler):
+                    def emit(self, rec):
+                        log_msgs.append(rec.getMessage())
+
+                for _ln in ("transformers", "torch"):
+                    h = _QHandler()
+                    h.setLevel(logging.WARNING)
+                    logr = logging.getLogger(_ln)
+                    logr.addHandler(h)
+                try:
+                    gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+                    if show_gpu:
+                        gpu_info = f"CUDA available: {torch.cuda.is_available()}"
+                        if torch.cuda.is_available():
+                            gpu_info += f", devices: {gpus}"
+                        tqdm.write(f"[subprocess] {gpu_info}")
+                    with warnings.catch_warnings(record=True) as w:
+                        warnings.simplefilter("always")
+                        try:
+                            forward_and_backward(v)
+                            q.put((True, None, gpus, [str(x.message) for x in w], log_msgs))
+                        except Exception as e:
+                            q.put((False, str(e)[:60], gpus, [str(x.message) for x in w], log_msgs))
+                finally:
+                    for _ln in ("transformers", "torch"):
+                        for h in logging.getLogger(_ln).handlers[:]:
+                            if isinstance(h, _QHandler):
+                                logging.getLogger(_ln).removeHandler(h)
+
+            proc = mp_ctx.Process(target=run_in_process, args=(result_queue, value_i, first_subprocess_run))
             try:
                 proc.start()
                 proc.join()
@@ -340,6 +366,7 @@ def find_max_minibatch(
                     err_msg_str = res[1]
                     n_gpus = res[2]
                     captured_warnings.extend(res[3] if len(res) > 3 else [])
+                    captured_warnings.extend(res[4] if len(res) > 4 else [])
                 else:
                     err_msg_str = f"Killed (exitcode {proc.exitcode})" if proc.exitcode else "Process died"
             except Exception:
@@ -349,14 +376,23 @@ def find_max_minibatch(
 
         if not use_subprocess:
             n_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
-            with warnings.catch_warnings(record=True) as w:
-                warnings.simplefilter("always")
-                try:
-                    forward_and_backward(value_i)
-                    ok = True
-                except Exception as e:
-                    err_msg_str = str(e)[:60]
-                captured_warnings.extend(str(x.message) for x in w)
+            _log_handler.setLevel(logging.WARNING)
+            _log_handler.setFormatter(logging.Formatter("%(message)s"))
+            for _logger_name in ("transformers", "torch"):
+                log = logging.getLogger(_logger_name)
+                log.addHandler(_log_handler)
+            try:
+                with warnings.catch_warnings(record=True) as w:
+                    warnings.simplefilter("always")
+                    try:
+                        forward_and_backward(value_i)
+                        ok = True
+                    except Exception as e:
+                        err_msg_str = str(e)[:60]
+                    captured_warnings.extend(str(x.message) for x in w)
+            finally:
+                for _logger_name in ("transformers", "torch"):
+                    logging.getLogger(_logger_name).removeHandler(_log_handler)
 
         if ok:
             successful.append(value_i)
@@ -390,10 +426,15 @@ def find_max_minibatch(
         if current_value < 1:
             break
 
-    if captured_warnings:
+    if captured_warnings or _log_records:
         seen = set()
         tqdm.write("")
         for msg in captured_warnings:
+            if msg not in seen:
+                seen.add(msg)
+                tqdm.write(f"⚠ {msg}")
+        for rec in _log_records:
+            msg = rec.getMessage()
             if msg not in seen:
                 seen.add(msg)
                 tqdm.write(f"⚠ {msg}")
