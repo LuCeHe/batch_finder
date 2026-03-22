@@ -418,7 +418,13 @@ def find_max_minibatch(
             tqdm.write("❌ Failed at value=1; no smaller value to try.")
             return None
 
-        if t_ok and t_ok[0]:
+        max_ok = max(successful) if successful else None
+        min_fail = min(unsuccessful) if unsuccessful else None
+        if max_ok is not None and min_fail is not None:
+            if min_fail <= max_ok + 1:
+                break
+            current_value = (max_ok + min_fail) // 2
+        elif t_ok and t_ok[0]:
             current_value = max(value_i + 1, int(value_i * factor_up))
         else:
             current_value = max(1, int(value_i / factor_down))
