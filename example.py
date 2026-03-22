@@ -43,18 +43,18 @@ if __name__ == "__main__":
 
     # 1a: (a, b, -1) - fixed a,b, maximize last axis
     print("\n1a. SimpleModel input_shape=(4, 8, -1)...")
-    max_1a = find_max_minibatch(model=model1, input_shape=(4, 8, -1), initial_value=64, inference_only=False, n_attempts=n_attempts_non_hf)
-    print(f"   Result: Max = {max_1a}")
+    res_1a = find_max_minibatch(model=model1, input_shape=(4, 8, -1), initial_value=64, inference_only=False, n_attempts=n_attempts_non_hf)
+    print(f"   Result: Final input shape = {res_1a}")
 
     # 1b: (-1, b, c, d) - maximize axis 0
     print("\n1b. SimpleModel input_shape=(-1, 4, 8, 16)...")
-    max_1b = find_max_minibatch(model=model1, input_shape=(-1, 4, 8, 16), initial_value=64, inference_only=True, n_attempts=n_attempts_non_hf)
-    print(f"   Result: Max = {max_1b}")
+    res_1b = find_max_minibatch(model=model1, input_shape=(-1, 4, 8, 16), initial_value=64, inference_only=True, n_attempts=n_attempts_non_hf)
+    print(f"   Result: Final input shape = {res_1b}")
 
     # 1c: (-1, b, -1, d) - maximize axes 0 and 2 (same value)
     print("\n1c. SimpleModel input_shape=(-1, 4, -1, 16)...")
-    max_1c = find_max_minibatch(model=model1, input_shape=(-1, 4, -1, 16), initial_value=32, inference_only=True, n_attempts=n_attempts_non_hf)
-    print(f"   Result: Max = {max_1c}")
+    res_1c = find_max_minibatch(model=model1, input_shape=(-1, 4, -1, 16), initial_value=32, inference_only=True, n_attempts=n_attempts_non_hf)
+    print(f"   Result: Final input shape = {res_1c}")
 
     # Example 2: Small HuggingFace model (requires: pip install transformers)
     try:
@@ -65,12 +65,24 @@ if __name__ == "__main__":
         max_batch_hf = find_max_minibatch(
             model=model2,
             axis_to_maximize="batch_size",
-            fixed_dims={"seq_len": 32},
+            fixed_axis={"seq_len": 32},
             initial_value=32,
             inference_only=False,
             n_attempts=n_attempts,
         )
         print(f"   Result: Max batch_size = {max_batch_hf}")
+
+        # 2b: Fix batch_size, maximize seq_len
+        print("\n2b. HuggingFace model – fix batch_size=2, maximize seq_len...")
+        max_seq_hf = find_max_minibatch(
+            model=model2,
+            axis_to_maximize="seq_len",
+            fixed_axis={"batch_size": 2},
+            initial_value=64,
+            inference_only=False,
+            n_attempts=n_attempts,
+        )
+        print(f"   Result: Max seq_len = {max_seq_hf}")
     except ImportError:
         print("\n2. Skipping HF example (pip install transformers to enable)")
 

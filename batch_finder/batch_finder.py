@@ -9,7 +9,7 @@ import time
 import warnings
 import multiprocessing
 import threading
-from typing import Optional, Callable, Dict, Any, Tuple, List
+from typing import Optional, Callable, Dict, Any, Tuple, List, Union
 import torch
 from tqdm import tqdm
 
@@ -155,43 +155,45 @@ def find_max_minibatch(
     model: torch.nn.Module,
     input_shape: Optional[Tuple[int, ...]] = None,
     axis_to_maximize: Optional[str] = None,
-    fixed_dims: Optional[Dict[str, int]] = None,
+    fixed_axis: Optional[Dict[str, int]] = None,
     device: Optional[torch.device] = None,
     delay: float = 3.0,
     initial_value: int = 1024,
     n_attempts: int = 50,
     inference_only: bool = False,
     factor_down: float = 2.0,
-    factor_up: float = 1.5,
-) -> Optional[int]:
+    factor_up: float = 2.0,
+) -> Optional[Union[int, Tuple[int, ...]]]:
     """
     Find the maximum value for the modifiable axis that the model can process without OOM.
 
     Supports two modes:
     1. input_shape: Tuple with -1 for the modifiable axis, numbers for fixed dims.
        E.g. (-1, 64, 256) maximizes axis 0 with fixed (64, 256).
-    2. axis_to_maximize + fixed_dims: For multi-input models (e.g. HuggingFace).
+    2. axis_to_maximize + fixed_axis: For multi-input models (e.g. HuggingFace).
 
     Search strategy: unsuccessful -> value/factor_down; successful -> value*factor_up.
-    Defaults: factor_down=2, factor_up=1.5 (i.e. /2 and *3/2).
+    Defaults: factor_down=2, factor_up=2 (i.e. /2 and *2).
 
     Args:
         model: PyTorch model (nn.Module or HuggingFace PreTrainedModel).
         input_shape: Tuple with -1 for variable axis, e.g. (-1, 64, 256). Takes precedence.
         axis_to_maximize: Name of axis to maximize when not using input_shape.
-        fixed_dims: Dict of fixed values when using axis_to_maximize.
+        fixed_axis: Dict of fixed values when using axis_to_maximize.
         device: Device to run on (default: cuda if available else cpu).
         delay: Delay in seconds between attempts.
         initial_value: Initial value to try (first attempt).
         n_attempts: Maximum attempts.
         inference_only: If True, skip forward gradients and backward pass. If False, runs full forward+backward.
         factor_down: On failure, next = value / factor_down (default 2).
-        factor_up: On success, next = value * factor_up (default 1.5).
+        factor_up: On success, next = value * factor_up (default 2).
 
     Returns:
-        Maximum value for the axis, or None if no value succeeded.
+        When using input_shape: final_input_shape (tuple with max value(s) filled in for -1).
+        When using axis_to_maximize: maximum value for the axis (int).
+        None if no value succeeded.
     """
-    fixed_dims = fixed_dims or {}
+    fixed_axis = fixed_axis or {}
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
 
@@ -210,7 +212,7 @@ def find_max_minibatch(
     shape_param_name = inputs_info[0][0] if use_input_shape else None
 
     # Build sample axis_values for size estimation
-    _sample_axis_values = {**fixed_dims}
+    _sample_axis_values = {**fixed_axis}
     if use_input_shape:
         _sample_shape = tuple(initial_value if s == -1 else s for s in input_shape)
         _sample_axis_values["batch_size"] = _sample_shape[0] if _sample_shape else initial_value
@@ -252,7 +254,7 @@ def find_max_minibatch(
                 else:
                     inputs[param_name] = torch.randn(p_shape, device=device)
         else:
-            axis_values = {**fixed_dims, axis_to_maximize: value}
+            axis_values = {**fixed_axis, axis_to_maximize: value}
             for param_name, _ in inputs_info:
                 shape = _get_default_shape_for_param(param_name, model, axis_values)
                 dtype = _infer_input_type(param_name)
@@ -296,7 +298,7 @@ def find_max_minibatch(
         if torch.cuda.is_available():
             torch.cuda.synchronize()
 
-    desc_base = f"shape={input_shape}" if use_input_shape else f"{axis_to_maximize} fixed={fixed_dims}"
+    desc_base = f"shape={input_shape}" if use_input_shape else f"{axis_to_maximize} fixed={fixed_axis}"
     pbar = tqdm(range(n_attempts), total=n_attempts, desc=desc_base, position=0, leave=True)
     captured_warnings: List[str] = []
     _log_records: List[logging.LogRecord] = []
@@ -447,6 +449,10 @@ def find_max_minibatch(
 
     if successful:
         result = max(successful)
+        if use_input_shape:
+            final_input_shape = tuple(result if s == -1 else s for s in input_shape)
+            tqdm.write(f"\n✅ Final input shape: {final_input_shape}")
+            return final_input_shape
         tqdm.write(f"\n✅ Max value that passed: {result}")
         return result
     tqdm.write("\n❌ No value passed without error.")

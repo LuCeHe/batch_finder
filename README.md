@@ -12,7 +12,7 @@ Batch Finder automatically detects your model's inputs (type and shape), fixes t
 
 - 🎯 **Single unified API** – One function `find_max_minibatch` for all cases
 - 🔍 **Automatic input detection** – Infers input names, types (int/float), and shapes from the model
-- 📐 **Flexible shape specification** – Use `input_shape` with `-1` for the variable axis, or `axis_to_maximize` + `fixed_dims`
+- 📐 **Flexible shape specification** – Use `input_shape` with `-1` for the variable axis, or `axis_to_maximize` + `fixed_axis`
 - 🚀 **Inference or full backward** – Test with or without gradients
 - ⚙️ **Configurable search** – Customize `factor_down`, `factor_up`, `n_attempts`, `initial_value`
 - 🛡️ **Safe testing** – Error handling, memory cleanup, returns `None` if fails at value 1
@@ -57,7 +57,7 @@ max_val = find_max_minibatch(model=model, input_shape=(4, 8, -1), initial_value=
 max_val = find_max_minibatch(model=model, input_shape=(-1, 4, -1, 16), initial_value=32)
 ```
 
-### Mode 2: `axis_to_maximize` + `fixed_dims` (multi-input models, e.g. HuggingFace)
+### Mode 2: `axis_to_maximize` + `fixed_axis` (multi-input models, e.g. HuggingFace)
 
 ```python
 from transformers import AutoModelForCausalLM
@@ -67,7 +67,7 @@ model = AutoModelForCausalLM.from_pretrained("distilgpt2")
 max_batch = find_max_minibatch(
     model=model,
     axis_to_maximize="batch_size",
-    fixed_dims={"seq_len": 32},
+    fixed_axis={"seq_len": 32},
     initial_value=32,
 )
 print(f"Max batch size: {max_batch}")
@@ -99,20 +99,33 @@ Find the maximum value for the modifiable axis without OOM.
 | `model` | `torch.nn.Module` | – | PyTorch or HuggingFace model |
 | `input_shape` | `Tuple[int, ...]` | `None` | Shape with `-1` for variable axis(s), e.g. `(-1, 64, 256)` |
 | `axis_to_maximize` | `str` | `None` | Axis name when not using `input_shape`, e.g. `"batch_size"` |
-| `fixed_dims` | `Dict[str, int]` | `{}` | Fixed values, e.g. `{"seq_len": 128}` |
+| `fixed_axis` | `Dict[str, int]` | `{}` | Fixed values, e.g. `{"seq_len": 128}` |
 | `device` | `torch.device` | auto | Device to run on |
 | `delay` | `float` | `3.0` | Seconds between attempts |
 | `initial_value` | `int` | `1024` | First value to try |
 | `n_attempts` | `int` | `50` | Maximum attempts |
 | `inference_only` | `bool` | `False` | If `True`, no gradients. If `False`, full forward+backward. |
 | `factor_down` | `float` | `2.0` | On failure: `next = value / factor_down` |
-| `factor_up` | `float` | `1.5` | On success: `next = value * factor_up` |
+| `factor_up` | `float` | `2.0` | On success: `next = value * factor_up` |
 
-**Returns:** `int` or `None` – Maximum value that passed, or `None` if none passed (including when value 1 fails).
+**Returns:** `Tuple[int, ...]` (when using `input_shape`), `int` (when using `axis_to_maximize`), or `None` if none passed.
 
 **Modes:**
 - Provide `input_shape`: uses first input param with the given shape; `-1` = variable axis.
-- Provide `axis_to_maximize` + `fixed_dims`: builds inputs from detected params and conventions.
+- Provide `axis_to_maximize` + `fixed_axis`: builds inputs from detected params and conventions.
+
+**Example output** (axis_to_maximize + fixed_axis):
+
+```
+--- Detected inputs (type, estimated shape) ---
+  input_ids: integer, (32, 64)
+  attention_mask: integer, (32, 64)
+---
+
+batch_size fixed={'seq_len': 32}: 100%|████████████████████| 22/50 [01:26<00:00,  3.9s/it, gpus=1, i=22/50, max_ok=1919, min_fail=1920, status=✅, value=1919]
+
+✅ Max value that passed: 1919
+```
 
 ## 🔧 How It Works
 
