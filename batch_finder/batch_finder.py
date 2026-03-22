@@ -3,6 +3,7 @@ Batch Finder - Core functionality for finding maximum batch sizes along variable
 """
 
 import inspect
+import sys
 import time
 import multiprocessing
 import threading
@@ -299,7 +300,8 @@ def find_max_minibatch(
     unsuccessful: List[int] = []
     current_value = initial_value
 
-    use_subprocess = True
+    # Subprocess + fork breaks CUDA context in child. Use in-process when GPU.
+    use_subprocess = sys.platform != "win32" and not torch.cuda.is_available()
     first_subprocess_run = True
     for i in pbar:
         value_i = max(1, current_value)

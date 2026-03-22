@@ -2,6 +2,7 @@
 Example usage of batch_finder package.
 """
 
+import argparse
 import torch
 import torch.nn as nn
 from batch_finder import find_max_minibatch
@@ -28,11 +29,15 @@ class SimpleModel(nn.Module):
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Batch Finder Examples")
+    parser.add_argument("--n-attempts", "-n", type=int, default=5, help="Max attempts per test (default: 50)")
+    args = parser.parse_args()
+
     print("=" * 60)
     print("Batch Finder Examples")
     print("=" * 60)
 
-    n_attempts = 50  # Number of attempts for each test case to find max batch size
+    n_attempts = args.n_attempts
     model1 = SimpleModel()
 
     # 1a: (a, b, -1) - fixed a,b, maximize last axis
