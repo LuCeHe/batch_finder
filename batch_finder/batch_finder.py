@@ -4,6 +4,7 @@ Batch Finder - Core functionality for finding maximum batch sizes along variable
 
 import inspect
 import time
+import multiprocessing
 import threading
 from typing import Optional, Callable, Dict, Any, Tuple, List
 import torch
@@ -298,43 +299,67 @@ def find_max_minibatch(
     unsuccessful: List[int] = []
     current_value = initial_value
 
+    use_subprocess = True
+    first_subprocess_run = True
     for i in pbar:
         value_i = max(1, current_value)
-        err_msg: List[str] = []
+        ok = False
+        err_msg_str: Optional[str] = None
 
-        def run_test(val: int) -> bool:
+        if use_subprocess:
+            result_queue = multiprocessing.Queue()
+
+            def run_in_process(q, v: int, show_gpu: bool = True):
+                if show_gpu:
+                    gpu_info = f"CUDA available: {torch.cuda.is_available()}"
+                    if torch.cuda.is_available():
+                        gpu_info += f", devices: {torch.cuda.device_count()}"
+                    tqdm.write(f"[subprocess] {gpu_info}")
+                try:
+                    forward_and_backward(v)
+                    q.put((True, None))
+                except Exception as e:
+                    q.put((False, str(e)[:60]))
+
+            proc = multiprocessing.Process(target=run_in_process, args=(result_queue, value_i, first_subprocess_run))
             try:
-                forward_and_backward(val)
-                return True
-            except Exception as e:
-                err_msg.append(str(e)[:60])
-                return False
-
-        t_ok: List[bool] = []
-
-        def run_test_capture(v: int):
-            ok = run_test(v)
-            t_ok.append(ok)
-            max_ok = max(successful) if successful else None
-            min_fail = min(unsuccessful) if unsuccessful else None
-            if ok:
-                successful.append(v)
-                max_ok = max(successful)
-                pbar.set_postfix(i=f"{i+1}/{n_attempts}", value=v, max_ok=max_ok, min_fail=min_fail, status="✅")
+                proc.start()
+                proc.join()
+                if proc.exitcode == 0:
+                    ok, err_msg_str = result_queue.get_nowait()
+                else:
+                    err_msg_str = f"Killed (exitcode {proc.exitcode})" if proc.exitcode else "Process died"
+            except Exception:
+                use_subprocess = False
             else:
-                unsuccessful.append(v)
-                min_fail = min(unsuccessful)
-                pf = {"i": f"{i+1}/{n_attempts}", "value": v, "max_ok": max_ok, "min_fail": min_fail, "status": "❌"}
-                if err_msg:
-                    pf["err"] = err_msg[-1][:40]
-                pbar.set_postfix(**pf)
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            time.sleep(delay)
+                first_subprocess_run = False
 
-        t = threading.Thread(target=run_test_capture, args=(value_i,))
-        t.start()
-        t.join()
+        if not use_subprocess:
+            try:
+                forward_and_backward(value_i)
+                ok = True
+            except Exception as e:
+                err_msg_str = str(e)[:60]
+
+        if ok:
+            successful.append(value_i)
+            pbar.set_postfix(
+                i=f"{i+1}/{n_attempts}", value=value_i,
+                max_ok=max(successful), min_fail=min(unsuccessful) if unsuccessful else None,
+                status="✅",
+            )
+        else:
+            unsuccessful.append(value_i)
+            pf = {"i": f"{i+1}/{n_attempts}", "value": value_i, "max_ok": max(successful) if successful else None, "min_fail": min(unsuccessful), "status": "❌"}
+            if err_msg_str:
+                pf["err"] = err_msg_str[:40]
+            pbar.set_postfix(**pf)
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        time.sleep(delay)
+
+        t_ok = [ok]
 
         if t_ok and not t_ok[0] and value_i == 1:
             tqdm.write("❌ Failed at value=1; no smaller value to try.")
