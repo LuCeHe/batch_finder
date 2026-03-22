@@ -5,6 +5,7 @@ Batch Finder - Core functionality for finding maximum batch sizes along variable
 import inspect
 import sys
 import time
+import warnings
 import multiprocessing
 import threading
 from typing import Optional, Callable, Dict, Any, Tuple, List
@@ -295,7 +296,8 @@ def find_max_minibatch(
             torch.cuda.synchronize()
 
     desc_base = f"shape={input_shape}" if use_input_shape else f"{axis_to_maximize} fixed={fixed_dims}"
-    pbar = tqdm(range(n_attempts), total=n_attempts, desc=desc_base, position=0, leave=False)
+    pbar = tqdm(range(n_attempts), total=n_attempts, desc=desc_base, position=0, leave=True)
+    captured_warnings: List[str] = []
     successful: List[int] = []
     unsuccessful: List[int] = []
     current_value = initial_value
@@ -320,18 +322,24 @@ def find_max_minibatch(
                     if torch.cuda.is_available():
                         gpu_info += f", devices: {gpus}"
                     tqdm.write(f"[subprocess] {gpu_info}")
-                try:
-                    forward_and_backward(v)
-                    q.put((True, None, gpus))
-                except Exception as e:
-                    q.put((False, str(e)[:60], gpus))
+                with warnings.catch_warnings(record=True) as w:
+                    warnings.simplefilter("always")
+                    try:
+                        forward_and_backward(v)
+                        q.put((True, None, gpus, [str(x.message) for x in w]))
+                    except Exception as e:
+                        q.put((False, str(e)[:60], gpus, [str(x.message) for x in w]))
 
             proc = multiprocessing.Process(target=run_in_process, args=(result_queue, value_i, first_subprocess_run))
             try:
                 proc.start()
                 proc.join()
                 if proc.exitcode == 0:
-                    ok, err_msg_str, n_gpus = result_queue.get_nowait()
+                    res = result_queue.get_nowait()
+                    ok = res[0]
+                    err_msg_str = res[1]
+                    n_gpus = res[2]
+                    captured_warnings.extend(res[3] if len(res) > 3 else [])
                 else:
                     err_msg_str = f"Killed (exitcode {proc.exitcode})" if proc.exitcode else "Process died"
             except Exception:
@@ -341,11 +349,14 @@ def find_max_minibatch(
 
         if not use_subprocess:
             n_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
-            try:
-                forward_and_backward(value_i)
-                ok = True
-            except Exception as e:
-                err_msg_str = str(e)[:60]
+            with warnings.catch_warnings(record=True) as w:
+                warnings.simplefilter("always")
+                try:
+                    forward_and_backward(value_i)
+                    ok = True
+                except Exception as e:
+                    err_msg_str = str(e)[:60]
+                captured_warnings.extend(str(x.message) for x in w)
 
         if ok:
             successful.append(value_i)
@@ -379,9 +390,17 @@ def find_max_minibatch(
         if current_value < 1:
             break
 
+    if captured_warnings:
+        seen = set()
+        tqdm.write("")
+        for msg in captured_warnings:
+            if msg not in seen:
+                seen.add(msg)
+                tqdm.write(f"⚠ {msg}")
+
     if successful:
         result = max(successful)
-        tqdm.write(f"\n\n✅ Max value that passed: {result}")
+        tqdm.write(f"\n✅ Max value that passed: {result}")
         return result
-    tqdm.write("\n\n❌ No value passed without error.")
+    tqdm.write("\n❌ No value passed without error.")
     return None
