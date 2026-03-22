@@ -303,32 +303,35 @@ def find_max_minibatch(
     # Subprocess + fork breaks CUDA context in child. Use in-process when GPU.
     use_subprocess = sys.platform != "win32" and not torch.cuda.is_available()
     first_subprocess_run = True
+    n_gpus = 0
     for i in pbar:
         value_i = max(1, current_value)
         ok = False
         err_msg_str: Optional[str] = None
+        n_gpus = 0
 
         if use_subprocess:
             result_queue = multiprocessing.Queue()
 
             def run_in_process(q, v: int, show_gpu: bool = True):
+                gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
                 if show_gpu:
                     gpu_info = f"CUDA available: {torch.cuda.is_available()}"
                     if torch.cuda.is_available():
-                        gpu_info += f", devices: {torch.cuda.device_count()}"
+                        gpu_info += f", devices: {gpus}"
                     tqdm.write(f"[subprocess] {gpu_info}")
                 try:
                     forward_and_backward(v)
-                    q.put((True, None))
+                    q.put((True, None, gpus))
                 except Exception as e:
-                    q.put((False, str(e)[:60]))
+                    q.put((False, str(e)[:60], gpus))
 
             proc = multiprocessing.Process(target=run_in_process, args=(result_queue, value_i, first_subprocess_run))
             try:
                 proc.start()
                 proc.join()
                 if proc.exitcode == 0:
-                    ok, err_msg_str = result_queue.get_nowait()
+                    ok, err_msg_str, n_gpus = result_queue.get_nowait()
                 else:
                     err_msg_str = f"Killed (exitcode {proc.exitcode})" if proc.exitcode else "Process died"
             except Exception:
@@ -337,6 +340,7 @@ def find_max_minibatch(
                 first_subprocess_run = False
 
         if not use_subprocess:
+            n_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
             try:
                 forward_and_backward(value_i)
                 ok = True
@@ -348,11 +352,11 @@ def find_max_minibatch(
             pbar.set_postfix(
                 i=f"{i+1}/{n_attempts}", value=value_i,
                 max_ok=max(successful), min_fail=min(unsuccessful) if unsuccessful else None,
-                status="✅",
+                gpus=n_gpus, status="✅",
             )
         else:
             unsuccessful.append(value_i)
-            pf = {"i": f"{i+1}/{n_attempts}", "value": value_i, "max_ok": max(successful) if successful else None, "min_fail": min(unsuccessful), "status": "❌"}
+            pf = {"i": f"{i+1}/{n_attempts}", "value": value_i, "max_ok": max(successful) if successful else None, "min_fail": min(unsuccessful), "gpus": n_gpus, "status": "❌"}
             if err_msg_str:
                 pf["err"] = err_msg_str[:40]
             pbar.set_postfix(**pf)
