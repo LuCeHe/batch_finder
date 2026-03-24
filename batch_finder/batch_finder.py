@@ -2,15 +2,18 @@
 Batch Finder - Core functionality for finding maximum batch sizes along variable axes.
 """
 
+import gc
 import inspect
 import logging
 import numbers
+import os
+import queue
 import sys
 import time
 import warnings
 import multiprocessing
 import threading
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Optional, Callable, Dict, Any, Tuple, List, Union
 import torch
 from tqdm import tqdm
@@ -223,20 +226,195 @@ def _get_default_shape_for_param(
     return (batch, seq_len)
 
 
+def _default_use_subprocess() -> bool:
+    """
+    On Linux/macOS, run each attempt in a child process so GPU/CPU OOM or SIGKILL usually
+    terminates only the child; the parent keeps searching with a smaller size.
+
+    Set ``BATCH_FINDER_SUBPROCESS=0`` to run in-process (lighter, but a hard OOM kill can
+    stop the whole script). Windows always runs in-process.
+    """
+    if sys.platform == "win32":
+        return False
+    env = os.environ.get("BATCH_FINDER_SUBPROCESS", "").strip().lower()
+    if env in ("0", "false", "no", "off"):
+        return False
+    return True
+
+
+def _process_rss_bytes() -> int:
+    """Best-effort resident set size (bytes). Linux ru_maxrss is KiB; macOS is bytes."""
+    try:
+        import resource as _res
+
+        rss = int(_res.getrusage(_res.RUSAGE_SELF).ru_maxrss)
+        if sys.platform == "darwin":
+            return rss
+        return rss * 1024
+    except Exception:
+        return 0
+
+
+def _resolve_cuda_mem_devices(
+    device: torch.device,
+    cuda_mem_devices: Optional[Union[int, Sequence[int], str]],
+) -> List[int]:
+    """
+    Which CUDA device indices to reset/read for peak memory stats.
+    ``None`` → only ``device``'s index. ``\"all\"`` → every visible GPU.
+    """
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return []
+    nd = torch.cuda.device_count()
+    if cuda_mem_devices is None:
+        idx = device.index if device.index is not None else torch.cuda.current_device()
+        return [int(idx) if idx >= 0 else 0]
+    if isinstance(cuda_mem_devices, str):
+        if cuda_mem_devices.strip().lower() == "all":
+            return list(range(nd))
+        raise ValueError('cuda_mem_devices as str must be "all"')
+    if isinstance(cuda_mem_devices, int):
+        devs = [int(cuda_mem_devices)]
+    else:
+        devs = [int(x) for x in cuda_mem_devices]
+    out = sorted(set(devs))
+    for d in out:
+        if d < 0 or d >= nd:
+            raise ValueError(f"cuda_mem_devices: invalid GPU index {d} (device_count={nd})")
+    return out
+
+
+def _cuda_multiplier_from_peaks(
+    peak_by_dev: Dict[int, int],
+    target_fraction: float,
+    max_multiplier: float,
+) -> Optional[float]:
+    """
+    Per-GPU linear headroom; return the **minimum** multiplier so the tightest GPU limits growth.
+    """
+    ms: List[float] = []
+    for dev, peak in peak_by_dev.items():
+        if peak <= 0:
+            continue
+        try:
+            tot = int(torch.cuda.get_device_properties(dev).total_memory)
+            m = (target_fraction * float(tot)) / float(peak)
+            ms.append(min(max_multiplier, max(1.05, m)))
+        except Exception:
+            pass
+    return min(ms) if ms else None
+
+
+def _memory_guided_success_multiplier(
+    peak_by_dev: Dict[int, int],
+    rss_delta: int,
+    *,
+    target_fraction: float,
+    max_multiplier: float,
+    fallback: float,
+) -> float:
+    """
+    How much to multiply the current batch after a successful step.
+    Multi-GPU: bottleneck is the GPU with least headroom (min multiplier).
+    """
+    candidates: List[float] = []
+    m = _cuda_multiplier_from_peaks(peak_by_dev, target_fraction, max_multiplier)
+    if m is not None:
+        candidates.append(m)
+    if rss_delta > 0:
+        try:
+            import psutil
+
+            avail = float(psutil.virtual_memory().available)
+            m2 = min(max_multiplier, max(1.05, 1.0 + 0.45 * (avail / float(rss_delta))))
+            candidates.append(m2)
+        except Exception:
+            pass
+    if not candidates:
+        return min(max_multiplier, max(1.05, fallback))
+    return min(min(candidates), max_multiplier)
+
+
+def _interpolated_bracket_guess(
+    max_ok: int,
+    min_fail: int,
+    peaks_at_max: Dict[int, int],
+    target_fraction: float,
+    max_multiplier: float,
+) -> Optional[int]:
+    """VRAM linear extrapolation from per-GPU peaks at max_ok; None → use plain mid."""
+    if min_fail <= max_ok + 1 or not peaks_at_max:
+        return None
+    if not torch.cuda.is_available():
+        return None
+    # Interpolation: allow large implied mult inside bracket (cap separately)
+    m = _cuda_multiplier_from_peaks(peaks_at_max, target_fraction, max_multiplier=1e9)
+    if m is None:
+        return None
+    try:
+        v_est = int(max_ok * min(m, max_multiplier))
+        v_est = max(max_ok + 1, min(v_est, min_fail - 1))
+        if max_ok < v_est < min_fail:
+            return v_est
+    except Exception:
+        pass
+    return None
+
+
+def _release_memory(device: torch.device, cuda_devs: List[int], aggressive: bool = False) -> None:
+    """Free allocator memory after a failed attempt (OOM paths)."""
+    if aggressive:
+        gc.collect()
+    if device.type == "cuda" and torch.cuda.is_available() and cuda_devs:
+        for d in cuda_devs:
+            try:
+                with torch.cuda.device(d):
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
+    elif device.type == "mps":
+        try:
+            if hasattr(torch, "mps") and torch.mps.is_available():
+                torch.mps.empty_cache()
+        except Exception:
+            pass
+
+
+def _default_delay_for_device(device: torch.device, delay: Optional[float]) -> float:
+    if delay is not None:
+        return delay
+    return 3.0 if device.type == "cuda" else 0.75
+
+
+def _default_initial_value_for_device(device: torch.device, initial_value: Optional[int]) -> int:
+    if initial_value is not None:
+        return initial_value
+    if device.type == "cuda":
+        return 512
+    if device.type == "mps":
+        return 64
+    return 32
+
+
 def find_max_minibatch(
     model: torch.nn.Module,
     axis_to_maximize: Optional[str] = None,
     fixed_axis: Optional[Dict[str, int]] = None,
     device: Optional[torch.device] = None,
-    delay: float = 3.0,
-    initial_value: int = 512,
+    delay: Optional[float] = None,
+    initial_value: Optional[int] = None,
     n_attempts: int = 50,
     inference_only: bool = False,
     factor_down: float = 2.0,
     factor_up: float = 2.0,
+    memory_guided: bool = True,
+    memory_target_fraction: float = 0.88,
+    max_growth_multiplier: float = 6.0,
+    cuda_mem_devices: Optional[Union[int, Sequence[int], str]] = None,
     input_shapes: Optional[
         Union[str, Tuple[Any, ...], List[Any], Dict[str, Any]]
     ] = None,
+    use_subprocess: Optional[bool] = None,
 ) -> Optional[Union[int, Tuple[int, ...]]]:
     """
     Find the maximum value for the modifiable axis that the model can process without OOM.
@@ -256,22 +434,35 @@ def find_max_minibatch(
     4. **axis_to_maximize + fixed_axis:** when ``input_shapes`` is omitted; for multi-input
        models (e.g. HuggingFace) by symbolic axis name.
 
-    Search strategy: unsuccessful -> value/factor_down; successful -> value*factor_up.
-    Defaults: factor_down=2, factor_up=2 (i.e. /2 and *2).
+    Search strategy: by default **memory-guided** on success (GPU peak VRAM vs device total,
+    optional CPU via RSS + psutil), capped by ``max_growth_multiplier`` (e.g. jump toward
+    ~6× in one step when headroom allows). On failure, divide by ``factor_down``; when both
+    a success and a failure bracket the answer, uses VRAM linear extrapolation when possible,
+    else bisection. Set ``memory_guided=False`` to use only ``factor_up`` / ``factor_down``.
 
     Args:
         model: PyTorch model (nn.Module or HuggingFace PreTrainedModel).
         axis_to_maximize: Name of axis to maximize when ``input_shapes`` is None.
         fixed_axis: Dict of fixed symbol or axis values (DSL extra symbols or HF-style keys).
         device: Device to run on (default: cuda if available else cpu).
-        delay: Delay in seconds between attempts.
-        initial_value: Initial value to try (first attempt).
+        delay: Seconds between attempts; default ``None`` → 3.0 on CUDA, 0.75 on CPU/MPS.
+        initial_value: First size to try; default ``None`` → 512 on CUDA, 64 on MPS, 32 on CPU.
         n_attempts: Maximum attempts.
         inference_only: If True, skip forward gradients and backward pass. If False, runs full forward+backward.
         factor_down: On failure, next = value / factor_down (default 2).
-        factor_up: On success, next = value * factor_up (default 2).
+        factor_up: On success when ``memory_guided=False``, next ≈ value * factor_up.
+        memory_guided: Use measured GPU/CPU memory to pick the next trial size (default True).
+        memory_target_fraction: Aim peak VRAM at this fraction of total GPU memory (e.g. 0.88).
+        max_growth_multiplier: Maximum single-step multiplicative increase after success (e.g. 6).
+        cuda_mem_devices: CUDA indices to measure for memory-guided steps. ``None`` = model
+            ``device`` only; ``\"all\"`` = every visible GPU; or e.g. ``[0, 1, 2]``. Uses the
+            **bottleneck** GPU (least headroom) to size the next step. Ignored when not on CUDA.
         input_shapes: DSL string, dict (named shapes + ``#constraints``), tuple/list of ints
             with ``-1``, or compact numeric tuple (ints + negative floats, see docstring).
+        use_subprocess: If ``True``, run each attempt in a child process (Linux/macOS only)
+            so OOM/SIGKILL in the worker usually does not stop the parent search. If ``False``,
+            always in-process (Windows default path). If ``None``, default is subprocess on
+            Linux/macOS; set env ``BATCH_FINDER_SUBPROCESS=0`` to force in-process.
 
     Returns:
         For int-only tuple/list ``input_shapes``: final shape tuple with each ``-1`` replaced
@@ -283,6 +474,9 @@ def find_max_minibatch(
     fixed_axis = fixed_axis or {}
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
+    delay = _default_delay_for_device(device, delay)
+    initial_value = _default_initial_value_for_device(device, initial_value)
+    cuda_devs = _resolve_cuda_mem_devices(device, cuda_mem_devices)
 
     shape_mode, shape_payload = _normalize_input_shapes_arg(input_shapes)
 
@@ -486,19 +680,39 @@ def find_max_minibatch(
                 return sum(t.sum() for t in tensors)
         raise ValueError("Could not extract loss from model output.")
 
-    def forward_and_backward(n: int):
-        model.zero_grad(set_to_none=True)
-        inputs = make_inputs(n)
-        if inference_only:
-            with torch.no_grad():
+    def forward_backward_measured(n: int) -> Tuple[bool, Optional[str], Dict[int, int], int]:
+        """Run one forward (+ optional backward); return (ok, err, peak_bytes_per_cuda_device, rss_delta)."""
+        rss0 = _process_rss_bytes()
+        peaks: Dict[int, int] = {}
+        err: Optional[str] = None
+        try:
+            for d in cuda_devs:
+                torch.cuda.reset_peak_memory_stats(d)
+            model.zero_grad(set_to_none=True)
+            inputs = make_inputs(n)
+            if inference_only:
+                with torch.no_grad():
+                    out = model(**inputs)
+                loss = get_loss(out)
+            else:
                 out = model(**inputs)
-            loss = get_loss(out)
-        else:
-            out = model(**inputs)
-            loss = get_loss(out)
-            loss.backward()
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
+                loss = get_loss(out)
+                loss.backward()
+            if cuda_devs:
+                for d in cuda_devs:
+                    torch.cuda.synchronize(d)
+                peaks = {d: int(torch.cuda.max_memory_allocated(d)) for d in cuda_devs}
+            return True, None, peaks, max(0, _process_rss_bytes() - rss0)
+        except Exception as e:
+            err = str(e)[:200]
+            if cuda_devs:
+                try:
+                    for d in cuda_devs:
+                        torch.cuda.synchronize(d)
+                    peaks = {d: int(torch.cuda.max_memory_allocated(d)) for d in cuda_devs}
+                except Exception:
+                    peaks = {}
+            return False, err, peaks, max(0, _process_rss_bytes() - rss0)
 
     if use_dsl:
         desc_base = f"input_shapes search={spec.search_symbol if spec else '?'}"
@@ -520,10 +734,17 @@ def find_max_minibatch(
     successful: List[int] = []
     unsuccessful: List[int] = []
     current_value = initial_value
+    success_peak_gpu_by_value: Dict[int, Dict[int, int]] = {}
 
-    # Use subprocess on Linux for OOM protection. Spawn (not fork) to avoid broken CUDA context.
-    use_subprocess = sys.platform != "win32"
-    mp_ctx = multiprocessing.get_context("spawn") if use_subprocess else None
+    tgt_frac = min(0.99, max(0.5, float(memory_target_fraction)))
+    max_mult = max(1.05, float(max_growth_multiplier))
+
+    # Subprocess: optional OOM isolation on CUDA; off by default on CPU to save RAM / semaphores.
+    mp_ctx = multiprocessing.get_context("spawn") if sys.platform != "win32" else None
+    mp_ok = bool(
+        mp_ctx is not None
+        and (use_subprocess if use_subprocess is not None else _default_use_subprocess())
+    )
     first_subprocess_run = True
     n_gpus = 0
     for i in pbar:
@@ -531,8 +752,13 @@ def find_max_minibatch(
         ok = False
         err_msg_str: Optional[str] = None
         n_gpus = 0
+        peak_gpu_attempt: Dict[int, int] = {}
+        rss_delta_attempt = 0
 
-        if use_subprocess and mp_ctx:
+        result_queue: Optional[Any] = None
+        proc: Optional[Any] = None
+
+        if mp_ok and mp_ctx:
             result_queue = mp_ctx.Queue()
 
             def run_in_process(q, v: int, show_gpu: bool = True):
@@ -556,11 +782,18 @@ def find_max_minibatch(
                         tqdm.write(f"[subprocess] {gpu_info}")
                     with warnings.catch_warnings(record=True) as w:
                         warnings.simplefilter("always")
-                        try:
-                            forward_and_backward(v)
-                            q.put((True, None, gpus, [str(x.message) for x in w], log_msgs))
-                        except Exception as e:
-                            q.put((False, str(e)[:60], gpus, [str(x.message) for x in w], log_msgs))
+                        ok_m, err_m, peak_g, rss_d = forward_backward_measured(v)
+                        q.put(
+                            (
+                                ok_m,
+                                err_m[:60] if err_m else None,
+                                gpus,
+                                [str(x.message) for x in w],
+                                log_msgs,
+                                peak_g,
+                                rss_d,
+                            )
+                        )
                 finally:
                     for _ln in ("transformers", "torch"):
                         for h in logging.getLogger(_ln).handlers[:]:
@@ -572,20 +805,46 @@ def find_max_minibatch(
                 proc.start()
                 proc.join()
                 if proc.exitcode == 0:
-                    res = result_queue.get_nowait()
+                    try:
+                        res = result_queue.get_nowait()
+                    except queue.Empty:
+                        res = (False, "empty result queue", 0, [], [], {}, 0)
                     ok = res[0]
                     err_msg_str = res[1]
                     n_gpus = res[2]
                     captured_warnings.extend(res[3] if len(res) > 3 else [])
                     captured_warnings.extend(res[4] if len(res) > 4 else [])
+                    if len(res) > 5 and isinstance(res[5], dict):
+                        peak_gpu_attempt = {int(k): int(v) for k, v in res[5].items()}
+                    elif len(res) > 5 and isinstance(res[5], int) and res[5] > 0 and cuda_devs:
+                        peak_gpu_attempt = {cuda_devs[0]: int(res[5])}
+                    rss_delta_attempt = int(res[6]) if len(res) > 6 else 0
                 else:
                     err_msg_str = f"Killed (exitcode {proc.exitcode})" if proc.exitcode else "Process died"
             except Exception:
-                use_subprocess = False
+                mp_ok = False
             else:
                 first_subprocess_run = False
+            finally:
+                if result_queue is not None:
+                    try:
+                        while True:
+                            try:
+                                result_queue.get_nowait()
+                            except queue.Empty:
+                                break
+                    except Exception:
+                        pass
+                    try:
+                        result_queue.close()
+                        result_queue.join_thread()
+                    except Exception:
+                        pass
+                if proc is not None and proc.is_alive():
+                    proc.terminate()
+                    proc.join(timeout=30)
 
-        if not use_subprocess:
+        if not mp_ok:
             n_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
             _log_handler.setLevel(logging.WARNING)
             _log_handler.setFormatter(logging.Formatter("%(message)s"))
@@ -595,11 +854,9 @@ def find_max_minibatch(
             try:
                 with warnings.catch_warnings(record=True) as w:
                     warnings.simplefilter("always")
-                    try:
-                        forward_and_backward(value_i)
-                        ok = True
-                    except Exception as e:
-                        err_msg_str = str(e)[:60]
+                    ok, err_inner, peak_gpu_attempt, rss_delta_attempt = forward_backward_measured(value_i)
+                    if err_inner:
+                        err_msg_str = err_inner[:60]
                     captured_warnings.extend(str(x.message) for x in w)
             finally:
                 for _logger_name in ("transformers", "torch"):
@@ -607,11 +864,19 @@ def find_max_minibatch(
 
         if ok:
             successful.append(value_i)
-            pbar.set_postfix(
-                i=f"{i+1}/{n_attempts}", value=value_i,
-                max_ok=max(successful), min_fail=min(unsuccessful) if unsuccessful else None,
-                gpus=n_gpus, status="✅",
-            )
+            if peak_gpu_attempt and any(v > 0 for v in peak_gpu_attempt.values()):
+                success_peak_gpu_by_value[value_i] = dict(peak_gpu_attempt)
+            pf_ok: Dict[str, Any] = {
+                "i": f"{i+1}/{n_attempts}",
+                "value": value_i,
+                "max_ok": max(successful),
+                "min_fail": min(unsuccessful) if unsuccessful else None,
+                "gpus": n_gpus,
+                "status": "✅",
+            }
+            if peak_gpu_attempt and any(v > 0 for v in peak_gpu_attempt.values()):
+                pf_ok["gpu_peak_mb"] = sum(peak_gpu_attempt.values()) // (1024 * 1024)
+            pbar.set_postfix(**pf_ok)
         else:
             unsuccessful.append(value_i)
             pf = {"i": f"{i+1}/{n_attempts}", "value": value_i, "max_ok": max(successful) if successful else None, "min_fail": min(unsuccessful), "gpus": n_gpus, "status": "❌"}
@@ -619,8 +884,7 @@ def find_max_minibatch(
                 pf["err"] = err_msg_str[:40]
             pbar.set_postfix(**pf)
 
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        _release_memory(device, cuda_devs, aggressive=not ok)
         time.sleep(delay)
 
         t_ok = [ok]
@@ -634,9 +898,26 @@ def find_max_minibatch(
         if max_ok is not None and min_fail is not None:
             if min_fail <= max_ok + 1:
                 break
-            current_value = (max_ok + min_fail) // 2
+            if memory_guided:
+                peak_at_max = success_peak_gpu_by_value.get(max_ok, {})
+                guess = _interpolated_bracket_guess(
+                    max_ok, min_fail, peak_at_max, tgt_frac, max_mult
+                )
+                current_value = guess if guess is not None else (max_ok + min_fail) // 2
+            else:
+                current_value = (max_ok + min_fail) // 2
         elif t_ok and t_ok[0]:
-            current_value = max(value_i + 1, int(value_i * factor_up))
+            if memory_guided:
+                mult = _memory_guided_success_multiplier(
+                    peak_gpu_attempt,
+                    rss_delta_attempt,
+                    target_fraction=tgt_frac,
+                    max_multiplier=max_mult,
+                    fallback=factor_up,
+                )
+                current_value = max(value_i + 1, int(value_i * mult))
+            else:
+                current_value = max(value_i + 1, int(value_i * factor_up))
         else:
             current_value = max(1, int(value_i / factor_down))
 

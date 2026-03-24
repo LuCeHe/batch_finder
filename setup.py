@@ -36,6 +36,9 @@ setup(
             "black>=21.0",
             "flake8>=3.8",
         ],
+        "cpu-mem": [
+            "psutil>=5.8",
+        ],
     },
 )
 

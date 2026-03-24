@@ -109,7 +109,6 @@ if __name__ == "__main__":
                 model=model2,
                 axis_to_maximize="batch_size",
                 fixed_axis={"seq_len": 32},
-                initial_value=32,
                 inference_only=False,
                 n_attempts=n_attempts,
             )
@@ -138,7 +137,6 @@ if __name__ == "__main__":
         res_3 = find_max_minibatch(
             model=model3,
             input_shapes=dsl,
-            initial_value=64,
             inference_only=False,
             n_attempts=n_attempts_non_hf,
         )
@@ -150,7 +148,6 @@ if __name__ == "__main__":
         res_4 = find_max_minibatch(
             model=model4,
             input_shapes=dsl,
-            initial_value=64,
             inference_only=False,
             n_attempts=n_attempts_non_hf,
         )
