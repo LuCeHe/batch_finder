@@ -19,6 +19,7 @@ import torch
 from tqdm import tqdm
 
 from .input_shapes import (
+    CONSTRAINTS_KEY,
     InputShapesSpec,
     materialize_compact_numeric_shape,
     materialize_shapes,
@@ -87,37 +88,6 @@ def _normalize_input_shapes_arg(
     )
 
 
-# Parameters to skip (not tensor inputs we can synthesize)
-_SKIP_PARAMS = {
-    "past_key_values", "head_mask", "encoder_hidden_states",
-    "encoder_attention_mask", "cross_attn_head_mask", "inputs_embeddings",
-    "inputs_embeds",  # HF: conflicts with input_ids
-    "use_cache", "output_attentions", "output_hidden_states", "return_dict",
-    "cache_position",  # HF: internal position tracking for KV cache
-    "logits_to_keep",  # HF: internal indexing, expects specific format
-}
-
-
-def _detect_model_inputs(model: torch.nn.Module) -> List[Tuple[str, Any]]:
-    """Detect input parameters from the model's forward signature."""
-    try:
-        sig = inspect.signature(model.forward)
-    except (ValueError, TypeError):
-        return []
-
-    params = []
-    for name, param in sig.parameters.items():
-        if name in ("self", "args", "kwargs"):
-            continue
-        if name in _SKIP_PARAMS:
-            continue
-        if param.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
-            continue
-        params.append((name, param))
-
-    return params
-
-
 def _infer_input_type(param_name: str, dtype_overrides: Optional[Dict[str, str]] = None) -> str:
     """Infer whether an input expects integer or float tensors."""
     if dtype_overrides and param_name in dtype_overrides:
@@ -129,72 +99,62 @@ def _infer_input_type(param_name: str, dtype_overrides: Optional[Dict[str, str]]
     return "float"
 
 
-def _get_hidden_size(model: torch.nn.Module) -> int:
-    """Infer hidden/embedding size from model."""
-    cfg = getattr(model, "config", None)
-    if cfg is not None:
+def _inputs_info_from_names(names: List[str]) -> List[Tuple[str, inspect.Parameter]]:
+    """Synthetic forward parameters when names come from ``input_shapes`` dict or ``forward_params``."""
+    return [
+        (n, inspect.Parameter(n, inspect.Parameter.POSITIONAL_OR_KEYWORD))
+        for n in names
+    ]
+
+
+def _get_hidden_size_from_config(config: Optional[Any]) -> int:
+    """Infer hidden/embedding size from a HuggingFace-style ``config`` object."""
+    if config is not None:
         for attr in ("hidden_size", "embed_dim", "d_model"):
-            v = getattr(cfg, attr, None)
+            v = getattr(config, attr, None)
             if v is not None:
                 return v
-    for m in model.modules():
-        if hasattr(m, "in_features"):
-            return m.in_features
-        if hasattr(m, "embedding_dim"):
-            return m.embedding_dim
     return 768
 
 
-def _estimate_shape_from_model(model: torch.nn.Module, param_name: str) -> Optional[Tuple[int, ...]]:
-    """Estimate input shape from model structure (layers, config)."""
+def _estimate_shape_from_config(
+    param_name: str, config: Optional[Any]
+) -> Optional[Tuple[int, ...]]:
+    """Rough shape hints from ``config`` only (no live module in the parent)."""
+    if config is None:
+        return None
     name_lower = param_name.lower()
-    cfg = getattr(model, "config", None)
-
-    # HuggingFace / config-driven
-    if cfg is not None:
-        if "input_ids" in name_lower or "attention_mask" in name_lower or "token_type" in name_lower:
-            seq = getattr(cfg, "max_position_embeddings", None) or getattr(cfg, "max_seq_length", None) or 512
-            return (2, seq)  # (batch, seq)
-        if "pixel" in name_lower:
-            h = getattr(cfg, "image_size", 224)
-            if not isinstance(h, int) and hasattr(cfg, "vision_config"):
-                vc = getattr(cfg, "vision_config", None)
-                h = getattr(vc, "image_size", 224) if vc else 224
-            h = h if isinstance(h, int) else 224
-            return (2, 3, h, h)
-
-    # From first consuming layer
-    for m in model.modules():
-        if isinstance(m, torch.nn.Linear):
-            return (2, 64, m.in_features)  # (batch, seq, hidden)
-        if isinstance(m, torch.nn.Embedding):
-            return (2, 64)  # (batch, seq) for token ids
-        if isinstance(m, (torch.nn.Conv1d, torch.nn.Conv2d)):
-            if hasattr(m, "in_channels"):
-                return (2, m.in_channels, 224, 224) if isinstance(m, torch.nn.Conv2d) else (2, m.in_channels, 64)
+    if "input_ids" in name_lower or "attention_mask" in name_lower or "token_type" in name_lower:
+        seq = getattr(config, "max_position_embeddings", None) or getattr(config, "max_seq_length", None) or 512
+        return (2, seq)
+    if "pixel" in name_lower:
+        h = getattr(config, "image_size", 224)
+        if not isinstance(h, int) and hasattr(config, "vision_config"):
+            vc = getattr(config, "vision_config", None)
+            h = getattr(vc, "image_size", 224) if vc else 224
+        h = h if isinstance(h, int) else 224
+        return (2, 3, h, h)
     return None
 
 
 def _get_default_shape_for_param(
     param_name: str,
-    model: torch.nn.Module,
     axis_values: Dict[str, int],
+    config: Optional[Any],
 ) -> Tuple[int, ...]:
-    """Get a default shape from model structure + axis values + conventions."""
+    """Default shape from naming conventions + optional ``config`` (HF-style)."""
     name_lower = param_name.lower()
 
     batch = axis_values.get("batch_size", 2)
     seq_len = axis_values.get("seq_len", 64)
     n_docs = axis_values.get("n_docs", 1)
-    hidden = _get_hidden_size(model)
+    hidden = _get_hidden_size_from_config(config)
 
-    # RAG-style: (n_docs, batch, seq) or similar
     if "encoder" in name_lower and "input" in name_lower:
         return (n_docs, batch, seq_len)
     if "encoder" in name_lower and "mask" in name_lower:
         return (n_docs, batch, seq_len)
 
-    # Standard: (batch, seq) or (batch, seq, hidden)
     if "input_ids" in name_lower or "attention_mask" in name_lower or "token_type" in name_lower:
         return (batch, seq_len)
     if "position_ids" in name_lower:
@@ -202,19 +162,16 @@ def _get_default_shape_for_param(
     if "labels" in name_lower or "label" in name_lower:
         return (batch, seq_len)
 
-    # pixel_values: (batch, channels, height, width)
     if "pixel" in name_lower:
         return (batch, 3, 224, 224)
 
-    # Generic x or input: infer from model (Linear.in_features, etc.) or (batch, seq, hidden)
     if name_lower in ("x", "input", "hidden_states", "inputs_embeddings"):
-        est = _estimate_shape_from_model(model, param_name)
+        est = _estimate_shape_from_config(param_name, config)
         if est is not None and len(est) >= 3:
-            return (batch, seq_len, est[2])  # use inferred last dim
+            return (batch, seq_len, est[2])
         return (batch, seq_len, hidden)
 
-    # Fallback: try model-based estimate
-    est = _estimate_shape_from_model(model, param_name)
+    est = _estimate_shape_from_config(param_name, config)
     if est is not None:
         out = list(est)
         if len(out) >= 1:
@@ -228,17 +185,17 @@ def _get_default_shape_for_param(
 
 def _default_use_subprocess() -> bool:
     """
-    On Linux/macOS, run each attempt in a child process so GPU/CPU OOM or SIGKILL usually
-    terminates only the child; the parent keeps searching with a smaller size.
-
-    Set ``BATCH_FINDER_SUBPROCESS=0`` to run in-process (lighter, but a hard OOM kill can
-    stop the whole script). Windows always runs in-process.
+    On Linux/macOS, run each attempt in a child by default: the parent never holds weights
+    (only ``get_model`` exists in workers). Env ``BATCH_FINDER_SUBPROCESS=0`` forces
+    in-process. Windows always in-process.
     """
     if sys.platform == "win32":
         return False
     env = os.environ.get("BATCH_FINDER_SUBPROCESS", "").strip().lower()
     if env in ("0", "false", "no", "off"):
         return False
+    if env in ("1", "true", "yes", "on"):
+        return True
     return True
 
 
@@ -397,7 +354,7 @@ def _default_initial_value_for_device(device: torch.device, initial_value: Optio
 
 
 def find_max_minibatch(
-    model: torch.nn.Module,
+    get_model: Callable[[], torch.nn.Module],
     axis_to_maximize: Optional[str] = None,
     fixed_axis: Optional[Dict[str, int]] = None,
     device: Optional[torch.device] = None,
@@ -415,6 +372,9 @@ def find_max_minibatch(
         Union[str, Tuple[Any, ...], List[Any], Dict[str, Any]]
     ] = None,
     use_subprocess: Optional[bool] = None,
+    *,
+    config: Optional[Any] = None,
+    forward_params: Optional[Sequence[str]] = None,
 ) -> Optional[Union[int, Tuple[int, ...]]]:
     """
     Find the maximum value for the modifiable axis that the model can process without OOM.
@@ -441,7 +401,9 @@ def find_max_minibatch(
     else bisection. Set ``memory_guided=False`` to use only ``factor_up`` / ``factor_down``.
 
     Args:
-        model: PyTorch model (nn.Module or HuggingFace PreTrainedModel).
+        get_model: Callable returning a fresh ``nn.Module`` per attempt (or per subprocess).
+            Picklable at top level under ``spawn`` (prefer a module-level function, not a
+            ``lambda``). The parent does not keep weights across attempts.
         axis_to_maximize: Name of axis to maximize when ``input_shapes`` is None.
         fixed_axis: Dict of fixed symbol or axis values (DSL extra symbols or HF-style keys).
         device: Device to run on (default: cuda if available else cpu).
@@ -454,15 +416,17 @@ def find_max_minibatch(
         memory_guided: Use measured GPU/CPU memory to pick the next trial size (default True).
         memory_target_fraction: Aim peak VRAM at this fraction of total GPU memory (e.g. 0.88).
         max_growth_multiplier: Maximum single-step multiplicative increase after success (e.g. 6).
-        cuda_mem_devices: CUDA indices to measure for memory-guided steps. ``None`` = model
-            ``device`` only; ``\"all\"`` = every visible GPU; or e.g. ``[0, 1, 2]``. Uses the
-            **bottleneck** GPU (least headroom) to size the next step. Ignored when not on CUDA.
+        cuda_mem_devices: CUDA indices for peak memory stats. ``None`` = ``device``'s index only;
+            ``\"all\"`` or ``[0, 1, …]`` for multi-GPU bottleneck. Ignored when not on CUDA.
         input_shapes: DSL string, dict (named shapes + ``#constraints``), tuple/list of ints
             with ``-1``, or compact numeric tuple (ints + negative floats, see docstring).
-        use_subprocess: If ``True``, run each attempt in a child process (Linux/macOS only)
-            so OOM/SIGKILL in the worker usually does not stop the parent search. If ``False``,
-            always in-process (Windows default path). If ``None``, default is subprocess on
-            Linux/macOS; set env ``BATCH_FINDER_SUBPROCESS=0`` to force in-process.
+        use_subprocess: If ``True``, each attempt runs in a child (Linux/macOS). If ``False``,
+            in-process. If ``None``, default is subprocess on Linux/macOS (parent has no weights).
+            Env ``BATCH_FINDER_SUBPROCESS`` overrides. Windows always in-process.
+        config: Optional HuggingFace-style config for vocab/hidden/default shapes. If omitted,
+            ``get_model()`` is called once, ``.config`` is read, then the module is discarded.
+        forward_params: Required when ``input_shapes`` is not a dict: ordered tensor argument
+            names for ``forward`` (same order as string DSL groups or ``axis_to_maximize`` inputs).
 
     Returns:
         For int-only tuple/list ``input_shapes``: final shape tuple with each ``-1`` replaced
@@ -473,7 +437,6 @@ def find_max_minibatch(
     """
     fixed_axis = fixed_axis or {}
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = model.to(device)
     delay = _default_delay_for_device(device, delay)
     initial_value = _default_initial_value_for_device(device, initial_value)
     cuda_devs = _resolve_cuda_mem_devices(device, cuda_mem_devices)
@@ -483,10 +446,33 @@ def find_max_minibatch(
     if shape_mode is not None and axis_to_maximize is not None:
         raise ValueError("Do not combine input_shapes with axis_to_maximize.")
 
-    # Detect inputs
-    inputs_info = _detect_model_inputs(model)
-    if not inputs_info:
-        raise ValueError("Could not detect model inputs from forward signature.")
+    if config is None:
+        _probe = get_model()
+        try:
+            config = getattr(_probe, "config", None)
+        finally:
+            del _probe
+            gc.collect()
+
+    cfg_effective = config
+
+    # Forward tensor arguments: dict keys (named DSL) or explicit forward_params
+    inputs_info: List[Tuple[str, inspect.Parameter]]
+    if shape_mode == "dict_dsl":
+        assert shape_payload is not None
+        ordered = [k for k in shape_payload if k != CONSTRAINTS_KEY]
+        if not ordered:
+            raise ValueError(
+                f"input_shapes dict must include tensor keys besides {CONSTRAINTS_KEY!r}."
+            )
+        inputs_info = _inputs_info_from_names(ordered)
+    elif forward_params is not None:
+        inputs_info = _inputs_info_from_names(list(forward_params))
+    else:
+        raise ValueError(
+            "Pass input_shapes as a dict (named DSL), or forward_params=[...] with tensor "
+            "argument names in order (same order as string DSL groups or axis_to_maximize inputs)."
+        )
 
     use_single_shape = shape_mode == "single"
     use_compact_shape = shape_mode == "compact"
@@ -526,13 +512,7 @@ def find_max_minibatch(
             for i, sh in enumerate(spec.shapes):
                 tqdm.write(f"    [{i}] {tuple(sh)}")
             tqdm.write("  Full forward signature (including skipped params):")
-            try:
-                for name, p in inspect.signature(model.forward).parameters.items():
-                    if name == "self":
-                        continue
-                    tqdm.write(f"    {name}: {p}")
-            except Exception as e:
-                tqdm.write(f"    (could not list: {e})")
+            tqdm.write("    (not available in parent — pass forward_params / dict keys to match forward)")
             tqdm.write("---\n")
             raise ValueError(
                 f"input_shapes has {len(spec.shapes)} tensor(s) but forward has {len(inputs_info)} tensor argument(s)."
@@ -582,7 +562,7 @@ def find_max_minibatch(
         elif use_single_shape and idx == 0 and single_shape is not None:
             shape = tuple(initial_value if s == -1 else s for s in single_shape)
         else:
-            shape = _get_default_shape_for_param(name, model, _sample_axis_values)
+            shape = _get_default_shape_for_param(name, _sample_axis_values, cfg_effective)
         tqdm.write(f"  {name}: {itype}, {shape}")
     tqdm.write("---")
 
@@ -597,7 +577,7 @@ def find_max_minibatch(
             for (param_name, _), shape in zip(inputs_info, shapes_list):
                 dtype = _infer_input_type(param_name, dtype_overrides)
                 if dtype == "integer":
-                    vocab = getattr(getattr(model, "config", None), "vocab_size", None) or 50257
+                    vocab = getattr(cfg_effective, "vocab_size", None) or 50257
                     inputs[param_name] = torch.randint(0, min(vocab, 1000), shape, device=device, dtype=torch.long)
                 else:
                     inputs[param_name] = torch.randn(
@@ -607,7 +587,7 @@ def find_max_minibatch(
             shape = materialize_compact_numeric_shape(compact_spec, value)
             dtype = _infer_input_type(shape_param_name)
             if dtype == "integer":
-                vocab = getattr(getattr(model, "config", None), "vocab_size", None) or 50257
+                vocab = getattr(cfg_effective, "vocab_size", None) or 50257
                 inputs[shape_param_name] = torch.randint(0, min(vocab, 1000), shape, device=device, dtype=torch.long)
             else:
                 inputs[shape_param_name] = torch.randn(
@@ -615,10 +595,10 @@ def find_max_minibatch(
                 )
             for param_name, _ in inputs_info[1:]:
                 axis_values = {"batch_size": shape[0] if len(shape) >= 1 else value, "seq_len": shape[1] if len(shape) >= 2 else 64}
-                p_shape = _get_default_shape_for_param(param_name, model, axis_values)
+                p_shape = _get_default_shape_for_param(param_name, axis_values, cfg_effective)
                 p_dtype = _infer_input_type(param_name)
                 if p_dtype == "integer":
-                    vocab = getattr(getattr(model, "config", None), "vocab_size", None) or 50257
+                    vocab = getattr(cfg_effective, "vocab_size", None) or 50257
                     inputs[param_name] = torch.randint(0, min(vocab, 1000), p_shape, device=device, dtype=torch.long)
                 else:
                     inputs[param_name] = torch.randn(
@@ -631,7 +611,7 @@ def find_max_minibatch(
             shape = tuple(shape)
             dtype = _infer_input_type(shape_param_name)
             if dtype == "integer":
-                vocab = getattr(getattr(model, "config", None), "vocab_size", None) or 50257
+                vocab = getattr(cfg_effective, "vocab_size", None) or 50257
                 inputs[shape_param_name] = torch.randint(0, min(vocab, 1000), shape, device=device, dtype=torch.long)
             else:
                 inputs[shape_param_name] = torch.randn(
@@ -640,10 +620,10 @@ def find_max_minibatch(
             # For multi-input: broadcast compatible shapes to other params (e.g. attention_mask)
             for param_name, _ in inputs_info[1:]:
                 axis_values = {"batch_size": shape[0] if len(shape) >= 1 else value, "seq_len": shape[1] if len(shape) >= 2 else 64}
-                p_shape = _get_default_shape_for_param(param_name, model, axis_values)
+                p_shape = _get_default_shape_for_param(param_name, axis_values, cfg_effective)
                 p_dtype = _infer_input_type(param_name)
                 if p_dtype == "integer":
-                    vocab = getattr(getattr(model, "config", None), "vocab_size", None) or 50257
+                    vocab = getattr(cfg_effective, "vocab_size", None) or 50257
                     inputs[param_name] = torch.randint(0, min(vocab, 1000), p_shape, device=device, dtype=torch.long)
                 else:
                     inputs[param_name] = torch.randn(
@@ -652,10 +632,10 @@ def find_max_minibatch(
         else:
             axis_values = {**fixed_axis, axis_to_maximize: value}
             for param_name, _ in inputs_info:
-                shape = _get_default_shape_for_param(param_name, model, axis_values)
+                shape = _get_default_shape_for_param(param_name, axis_values, cfg_effective)
                 dtype = _infer_input_type(param_name)
                 if dtype == "integer":
-                    vocab = getattr(getattr(model, "config", None), "vocab_size", None) or 50257
+                    vocab = getattr(cfg_effective, "vocab_size", None) or 50257
                     t = torch.randint(0, min(vocab, 1000), shape, device=device, dtype=torch.long)
                 else:
                     t = torch.randn(shape, device=device, requires_grad=_float_requires_grad)
@@ -680,7 +660,9 @@ def find_max_minibatch(
                 return sum(t.sum() for t in tensors)
         raise ValueError("Could not extract loss from model output.")
 
-    def forward_backward_measured(n: int) -> Tuple[bool, Optional[str], Dict[int, int], int]:
+    def forward_backward_measured(
+        active_model: torch.nn.Module, n: int
+    ) -> Tuple[bool, Optional[str], Dict[int, int], int]:
         """Run one forward (+ optional backward); return (ok, err, peak_bytes_per_cuda_device, rss_delta)."""
         rss0 = _process_rss_bytes()
         peaks: Dict[int, int] = {}
@@ -688,14 +670,14 @@ def find_max_minibatch(
         try:
             for d in cuda_devs:
                 torch.cuda.reset_peak_memory_stats(d)
-            model.zero_grad(set_to_none=True)
+            active_model.zero_grad(set_to_none=True)
             inputs = make_inputs(n)
             if inference_only:
                 with torch.no_grad():
-                    out = model(**inputs)
+                    out = active_model(**inputs)
                 loss = get_loss(out)
             else:
-                out = model(**inputs)
+                out = active_model(**inputs)
                 loss = get_loss(out)
                 loss.backward()
             if cuda_devs:
@@ -739,7 +721,7 @@ def find_max_minibatch(
     tgt_frac = min(0.99, max(0.5, float(memory_target_fraction)))
     max_mult = max(1.05, float(max_growth_multiplier))
 
-    # Subprocess: optional OOM isolation on CUDA; off by default on CPU to save RAM / semaphores.
+    # Subprocess: worker holds the only model copy (Linux/macOS default).
     mp_ctx = multiprocessing.get_context("spawn") if sys.platform != "win32" else None
     mp_ok = bool(
         mp_ctx is not None
@@ -780,20 +762,28 @@ def find_max_minibatch(
                         if torch.cuda.is_available():
                             gpu_info += f", devices: {gpus}"
                         tqdm.write(f"[subprocess] {gpu_info}")
-                    with warnings.catch_warnings(record=True) as w:
-                        warnings.simplefilter("always")
-                        ok_m, err_m, peak_g, rss_d = forward_backward_measured(v)
-                        q.put(
-                            (
-                                ok_m,
-                                err_m[:60] if err_m else None,
-                                gpus,
-                                [str(x.message) for x in w],
-                                log_msgs,
-                                peak_g,
-                                rss_d,
+                    active: Optional[torch.nn.Module] = None
+                    try:
+                        active = get_model()
+                        active = active.to(device)
+                        with warnings.catch_warnings(record=True) as w:
+                            warnings.simplefilter("always")
+                            ok_m, err_m, peak_g, rss_d = forward_backward_measured(active, v)
+                            q.put(
+                                (
+                                    ok_m,
+                                    err_m[:60] if err_m else None,
+                                    gpus,
+                                    [str(x.message) for x in w],
+                                    log_msgs,
+                                    peak_g,
+                                    rss_d,
+                                )
                             )
-                        )
+                    finally:
+                        if active is not None:
+                            del active
+                        gc.collect()
                 finally:
                     for _ln in ("transformers", "torch"):
                         for h in logging.getLogger(_ln).handlers[:]:
@@ -854,7 +844,19 @@ def find_max_minibatch(
             try:
                 with warnings.catch_warnings(record=True) as w:
                     warnings.simplefilter("always")
-                    ok, err_inner, peak_gpu_attempt, rss_delta_attempt = forward_backward_measured(value_i)
+                    ok = False
+                    err_inner: Optional[str] = None
+                    active_ip: Optional[torch.nn.Module] = None
+                    try:
+                        active_ip = get_model()
+                        active_ip = active_ip.to(device)
+                        ok, err_inner, peak_gpu_attempt, rss_delta_attempt = forward_backward_measured(
+                            active_ip, value_i
+                        )
+                    finally:
+                        if active_ip is not None:
+                            del active_ip
+                        gc.collect()
                     if err_inner:
                         err_msg_str = err_inner[:60]
                     captured_warnings.extend(str(x.message) for x in w)
