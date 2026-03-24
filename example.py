@@ -74,20 +74,20 @@ if __name__ == "__main__":
         model1 = SimpleModel()
 
         # 1a: (a, b, -1) - fixed a,b, maximize last axis
-        print("\n1a. SimpleModel input_shape=(4, 8, -1)...")
-        res_1a = find_max_minibatch(model=model1, input_shape=(4, 8, -1), initial_value=64, inference_only=False,
+        print("\n1a. SimpleModel input_shapes=(4, 8, -1)...")
+        res_1a = find_max_minibatch(model=model1, input_shapes=(4, 8, -1), initial_value=64, inference_only=False,
                                     n_attempts=n_attempts_non_hf)
         print(f"   Result: Final input shape = {res_1a}")
 
         # 1b: (-1, b, c, d) - maximize axis 0
-        print("\n1b. SimpleModel input_shape=(-1, 4, 8, 16)...")
-        res_1b = find_max_minibatch(model=model1, input_shape=(-1, 4, 8, 16), initial_value=64, inference_only=True,
+        print("\n1b. SimpleModel input_shapes=(-1, 4, 8, 16)...")
+        res_1b = find_max_minibatch(model=model1, input_shapes=(-1, 4, 8, 16), initial_value=64, inference_only=True,
                                     n_attempts=n_attempts_non_hf)
         print(f"   Result: Final input shape = {res_1b}")
 
         # 1c: (-1, b, -1, d) - maximize axes 0 and 2 (same value)
-        print("\n1c. SimpleModel input_shape=(-1, 4, -1, 16)...")
-        res_1c = find_max_minibatch(model=model1, input_shape=(-1, 4, -1, 16), initial_value=32, inference_only=True,
+        print("\n1c. SimpleModel input_shapes=(-1, 4, -1, 16)...")
+        res_1c = find_max_minibatch(model=model1, input_shapes=(-1, 4, -1, 16), initial_value=32, inference_only=True,
                                     n_attempts=n_attempts_non_hf)
         print(f"   Result: Final input shape = {res_1c}")
 

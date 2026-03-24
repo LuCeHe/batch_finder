@@ -6,12 +6,22 @@ and sequence length (timesteps) that your model can handle without running out o
 """
 
 from .batch_finder import find_max_minibatch
-from .input_shapes import InputShapesSpec, materialize_shapes, parse_input_shapes
+from .input_shapes import (
+    CONSTRAINTS_KEY,
+    FINDER_CONSTRAINTS_KEY,
+    InputShapesSpec,
+    materialize_shapes,
+    parse_input_shapes,
+    parse_input_shapes_dict,
+)
 
 __version__ = "0.1.0"
 __all__ = [
     "find_max_minibatch",
     "parse_input_shapes",
+    "parse_input_shapes_dict",
+    "CONSTRAINTS_KEY",
+    "FINDER_CONSTRAINTS_KEY",
     "InputShapesSpec",
     "materialize_shapes",
 ]

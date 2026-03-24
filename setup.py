@@ -5,7 +5,7 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 setup(
     name="batch-finder",
-    version="0.2.0",
+    version="0.3.0",
     author="Luca Herrtti",
     author_email="luca.herrtti@gmail.com",
     description="Find maximum batch size, documents, and timesteps for PyTorch models",
