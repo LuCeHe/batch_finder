@@ -12,7 +12,7 @@ Batch Finder automatically detects your model's inputs (type and shape), fixes t
 
 - 🎯 **Single unified API** – One function `find_max_minibatch` for all cases
 - 🔍 **Automatic input detection** – Infers input names, types (int/float), and shapes from the model
-- 📐 **Flexible shape specification** – Use `input_shape` with `-1` for the variable axis, or `axis_to_maximize` + `fixed_axis`
+- 📐 **Flexible shape specification** – `input_shape` with `-1`, compact **`input_shapes`** string for multi-tensor symbolic sizes, or `axis_to_maximize` + `fixed_axis`
 - 🚀 **Inference or full backward** – Test with or without gradients
 - ⚙️ **Configurable search** – Customize `factor_down`, `factor_up`, `n_attempts`, `initial_value`
 - 🛡️ **Safe testing** – Error handling, memory cleanup, returns `None` if fails at value 1
@@ -44,17 +44,13 @@ from batch_finder import find_max_minibatch
 model = MyModel()
 
 # Maximize axis 0, fix (64, 256)
-max_val = find_max_minibatch(
-    model=model,
-    input_shape=(-1, 64, 256),
-    initial_value=64,
-)
+max_val = find_max_minibatch(model=model, input_shape=(-1, 64, 256))
 
 # Maximize axis 2, fix (4, 8)
-max_val = find_max_minibatch(model=model, input_shape=(4, 8, -1), initial_value=32)
+max_val = find_max_minibatch(model=model, input_shape=(4, 8, -1))
 
 # Multiple -1: same value for all variable axes
-max_val = find_max_minibatch(model=model, input_shape=(-1, 4, -1, 16), initial_value=32)
+max_val = find_max_minibatch(model=model, input_shape=(-1, 4, -1, 16))
 ```
 
 ### Mode 2: `axis_to_maximize` + `fixed_axis` (multi-input models, e.g. HuggingFace)
@@ -68,10 +64,39 @@ max_batch = find_max_minibatch(
     model=model,
     axis_to_maximize="batch_size",
     fixed_axis={"seq_len": 32},
-    initial_value=32,
 )
 print(f"Max batch size: {max_batch}")
 ```
+
+### Mode 3: `input_shapes` (compact multi-tensor string)
+
+For models whose `forward` takes **several tensors**, you can pass one **compact string** instead of a single `input_shape` tuple. It lists a shape tuple **per argument** (same order as `forward`), uses **names** for dimensions that must match across tensors, optional **constraints** between names, and marks **exactly one** searched dimension with `name=-1`.
+
+**Layout:**  
+`(dims...), (dims...), ... , constraint, constraint, ...`
+
+- **Dimensions:** non‑negative integers, or identifiers (`b`, `t`, …). The same name in different positions ties those axes to the **same** size when materialized.
+- **Search:** one assignment must be `symbol=-1`. Batch Finder binary‑searches that symbol (e.g. maximize `b`).
+- **Constraints:** `name=rhs` where `rhs` can be an integer, another name, `coef*name`, `coef` stuck to a name (e.g. `1.5b`), or `name*name`. Values that are not integers are **rounded** to the nearest integer for tensor sizes.
+
+```python
+import torch
+from batch_finder import find_max_minibatch
+
+class MyModel(torch.nn.Module):
+    def forward(self, x, y):
+        # x: (23, b, t, 45), y: (b, t, 12) — example layout
+        ...
+
+model = MyModel()
+max_b = find_max_minibatch(
+    model=model,
+    input_shapes="(23, b, t, 45),(b, t, 12), t=1.5b, b=-1",
+)
+# Searches b; sets t = round(1.5 * b) each trial. Returns max b (int).
+```
+
+Mutually exclusive with `input_shape` and with `axis_to_maximize`. Pass `input_shapes=` as a **keyword** argument (it is the last parameter of `find_max_minibatch`).
 
 ### Custom search parameters
 
@@ -98,20 +123,22 @@ Find the maximum value for the modifiable axis without OOM.
 |-----------|------|---------|-------------|
 | `model` | `torch.nn.Module` | – | PyTorch or HuggingFace model |
 | `input_shape` | `Tuple[int, ...]` | `None` | Shape with `-1` for variable axis(s), e.g. `(-1, 64, 256)` |
-| `axis_to_maximize` | `str` | `None` | Axis name when not using `input_shape`, e.g. `"batch_size"` |
+| `input_shapes` | `str` | `None` | Compact multi-tensor DSL (see Mode 3). Mutually exclusive with `input_shape` |
+| `axis_to_maximize` | `str` | `None` | Axis name when not using `input_shape` / `input_shapes`, e.g. `"batch_size"` |
 | `fixed_axis` | `Dict[str, int]` | `{}` | Fixed values, e.g. `{"seq_len": 128}` |
 | `device` | `torch.device` | auto | Device to run on |
 | `delay` | `float` | `3.0` | Seconds between attempts |
-| `initial_value` | `int` | `1024` | First value to try |
+| `initial_value` | `int` | `512` | First value to try |
 | `n_attempts` | `int` | `50` | Maximum attempts |
 | `inference_only` | `bool` | `False` | If `True`, no gradients. If `False`, full forward+backward. |
 | `factor_down` | `float` | `2.0` | On failure: `next = value / factor_down` |
 | `factor_up` | `float` | `2.0` | On success: `next = value * factor_up` |
 
-**Returns:** `Tuple[int, ...]` (when using `input_shape`), `int` (when using `axis_to_maximize`), or `None` if none passed.
+**Returns:** `Tuple[int, ...]` (when using `input_shape`), `int` (when using `input_shapes` or `axis_to_maximize`), or `None` if nothing succeeded.
 
 **Modes:**
 - Provide `input_shape`: uses first input param with the given shape; `-1` = variable axis.
+- Provide `input_shapes`: one shape tuple per `forward` tensor; symbolic names + `symbol=-1` + optional constraints.
 - Provide `axis_to_maximize` + `fixed_axis`: builds inputs from detected params and conventions.
 
 **Example output** (axis_to_maximize + fixed_axis):

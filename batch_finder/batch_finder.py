@@ -13,6 +13,8 @@ from typing import Optional, Callable, Dict, Any, Tuple, List, Union
 import torch
 from tqdm import tqdm
 
+from .input_shapes import InputShapesSpec, materialize_shapes, parse_input_shapes, collect_symbols_in_shapes
+
 
 # Parameters to skip (not tensor inputs we can synthesize)
 _SKIP_PARAMS = {
@@ -158,28 +160,33 @@ def find_max_minibatch(
     fixed_axis: Optional[Dict[str, int]] = None,
     device: Optional[torch.device] = None,
     delay: float = 3.0,
-    initial_value: int = 1024,
+    initial_value: int = 512,
     n_attempts: int = 50,
     inference_only: bool = False,
     factor_down: float = 2.0,
     factor_up: float = 2.0,
+    input_shapes: Optional[str] = None,
 ) -> Optional[Union[int, Tuple[int, ...]]]:
     """
     Find the maximum value for the modifiable axis that the model can process without OOM.
 
-    Supports two modes:
-    1. input_shape: Tuple with -1 for the modifiable axis, numbers for fixed dims.
+    Supports three modes:
+    1. input_shapes: DSL string with one shape tuple per forward tensor argument, shared
+       symbols, optional constraints (e.g. ``t=1.5b``), and exactly one ``symbol=-1`` for
+       the dimension to maximize.
+    2. input_shape: Tuple with -1 for the modifiable axis, numbers for fixed dims.
        E.g. (-1, 64, 256) maximizes axis 0 with fixed (64, 256).
-    2. axis_to_maximize + fixed_axis: For multi-input models (e.g. HuggingFace).
+    3. axis_to_maximize + fixed_axis: For multi-input models (e.g. HuggingFace).
 
     Search strategy: unsuccessful -> value/factor_down; successful -> value*factor_up.
     Defaults: factor_down=2, factor_up=2 (i.e. /2 and *2).
 
     Args:
         model: PyTorch model (nn.Module or HuggingFace PreTrainedModel).
-        input_shape: Tuple with -1 for variable axis, e.g. (-1, 64, 256). Takes precedence.
-        axis_to_maximize: Name of axis to maximize when not using input_shape.
-        fixed_axis: Dict of fixed values when using axis_to_maximize.
+        input_shape: Tuple with -1 for variable axis, e.g. (-1, 64, 256). Mutually exclusive
+            with input_shapes.
+        axis_to_maximize: Name of axis to maximize when not using input_shape/input_shapes.
+        fixed_axis: Dict of fixed symbol or axis values (DSL extra symbols or HF-style keys).
         device: Device to run on (default: cuda if available else cpu).
         delay: Delay in seconds between attempts.
         initial_value: Initial value to try (first attempt).
@@ -187,33 +194,57 @@ def find_max_minibatch(
         inference_only: If True, skip forward gradients and backward pass. If False, runs full forward+backward.
         factor_down: On failure, next = value / factor_down (default 2).
         factor_up: On success, next = value * factor_up (default 2).
+        input_shapes: Multi-tensor symbolic shape DSL (mutually exclusive with input_shape).
 
     Returns:
         When using input_shape: final_input_shape (tuple with max value(s) filled in for -1).
-        When using axis_to_maximize: maximum value for the axis (int).
+        When using input_shapes or axis_to_maximize: maximum value for the searched symbol / axis (int).
         None if no value succeeded.
     """
     fixed_axis = fixed_axis or {}
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
 
+    if input_shapes is not None and input_shape is not None:
+        raise ValueError("Provide only one of input_shapes or input_shape.")
+    if input_shapes is not None and axis_to_maximize is not None:
+        raise ValueError("Do not combine input_shapes with axis_to_maximize.")
+
     # Detect inputs
     inputs_info = _detect_model_inputs(model)
     if not inputs_info:
         raise ValueError("Could not detect model inputs from forward signature.")
 
-    use_input_shape = input_shape is not None
-    if use_input_shape and -1 not in input_shape:
-        raise ValueError("input_shape must contain at least one -1 for the modifiable axis.")
-    if not use_input_shape and not axis_to_maximize:
-        raise ValueError("Must provide either input_shape or axis_to_maximize.")
+    use_dsl = input_shapes is not None
+    use_input_shape = input_shape is not None and not use_dsl
+    spec: Optional[InputShapesSpec] = None
+
+    if use_dsl:
+        spec = parse_input_shapes(input_shapes)
+        if len(spec.shapes) != len(inputs_info):
+            raise ValueError(
+                f"input_shapes has {len(spec.shapes)} tensor(s) but forward has {len(inputs_info)} tensor argument(s)."
+            )
+        syms = collect_symbols_in_shapes(spec)
+        if spec.search_symbol not in syms:
+            raise ValueError(
+                f"search symbol {spec.search_symbol!r} must appear in at least one shape tuple."
+            )
+    elif use_input_shape:
+        if -1 not in input_shape:
+            raise ValueError("input_shape must contain at least one -1 for the modifiable axis.")
+    elif not axis_to_maximize:
+        raise ValueError("Must provide input_shapes, input_shape, or axis_to_maximize.")
 
     modifiable_axis_idxs = [i for i, s in enumerate(input_shape) if s == -1] if (use_input_shape and input_shape) else []
     shape_param_name = inputs_info[0][0] if use_input_shape else None
 
     # Build sample axis_values for size estimation
     _sample_axis_values = {**fixed_axis}
-    if use_input_shape:
+    if use_dsl and spec is not None:
+        _, binds = materialize_shapes(spec, initial_value, fixed_axis)
+        _sample_axis_values.update(binds)
+    elif use_input_shape:
         _sample_shape = tuple(initial_value if s == -1 else s for s in input_shape)
         _sample_axis_values["batch_size"] = _sample_shape[0] if _sample_shape else initial_value
         _sample_axis_values["seq_len"] = _sample_shape[1] if len(_sample_shape) > 1 else 64
@@ -223,16 +254,34 @@ def find_max_minibatch(
     tqdm.write("\n\n--- Detected inputs (type, estimated shape) ---")
     for idx, (name, _) in enumerate(inputs_info):
         itype = _infer_input_type(name)
-        if use_input_shape and idx == 0:
+        if use_dsl and spec is not None:
+            shapes_list, _ = materialize_shapes(spec, initial_value, fixed_axis)
+            shape = shapes_list[idx]
+        elif use_input_shape and idx == 0:
             shape = tuple(initial_value if s == -1 else s for s in input_shape)
         else:
             shape = _get_default_shape_for_param(name, model, _sample_axis_values)
         tqdm.write(f"  {name}: {itype}, {shape}")
     tqdm.write("---")
 
+    # Float inputs must require grad when training-mode probing so loss.backward() has a graph.
+    # (Models with no nn.Parameter still need leaf tensors with requires_grad=True.)
+    _float_requires_grad = not inference_only
+
     def make_inputs(value: int) -> Dict[str, torch.Tensor]:
         inputs = {}
-        if use_input_shape:
+        if use_dsl and spec is not None:
+            shapes_list, _ = materialize_shapes(spec, value, fixed_axis)
+            for (param_name, _), shape in zip(inputs_info, shapes_list):
+                dtype = _infer_input_type(param_name)
+                if dtype == "integer":
+                    vocab = getattr(getattr(model, "config", None), "vocab_size", None) or 50257
+                    inputs[param_name] = torch.randint(0, min(vocab, 1000), shape, device=device, dtype=torch.long)
+                else:
+                    inputs[param_name] = torch.randn(
+                        shape, device=device, requires_grad=_float_requires_grad
+                    )
+        elif use_input_shape:
             shape = list(input_shape)
             for idx in modifiable_axis_idxs:
                 shape[idx] = value
@@ -242,7 +291,9 @@ def find_max_minibatch(
                 vocab = getattr(getattr(model, "config", None), "vocab_size", None) or 50257
                 inputs[shape_param_name] = torch.randint(0, min(vocab, 1000), shape, device=device, dtype=torch.long)
             else:
-                inputs[shape_param_name] = torch.randn(shape, device=device)
+                inputs[shape_param_name] = torch.randn(
+                    shape, device=device, requires_grad=_float_requires_grad
+                )
             # For multi-input: broadcast compatible shapes to other params (e.g. attention_mask)
             for param_name, _ in inputs_info[1:]:
                 axis_values = {"batch_size": shape[0] if len(shape) >= 1 else value, "seq_len": shape[1] if len(shape) >= 2 else 64}
@@ -252,7 +303,9 @@ def find_max_minibatch(
                     vocab = getattr(getattr(model, "config", None), "vocab_size", None) or 50257
                     inputs[param_name] = torch.randint(0, min(vocab, 1000), p_shape, device=device, dtype=torch.long)
                 else:
-                    inputs[param_name] = torch.randn(p_shape, device=device)
+                    inputs[param_name] = torch.randn(
+                        p_shape, device=device, requires_grad=_float_requires_grad
+                    )
         else:
             axis_values = {**fixed_axis, axis_to_maximize: value}
             for param_name, _ in inputs_info:
@@ -262,7 +315,7 @@ def find_max_minibatch(
                     vocab = getattr(getattr(model, "config", None), "vocab_size", None) or 50257
                     t = torch.randint(0, min(vocab, 1000), shape, device=device, dtype=torch.long)
                 else:
-                    t = torch.randn(shape, device=device)
+                    t = torch.randn(shape, device=device, requires_grad=_float_requires_grad)
                 inputs[param_name] = t
         return inputs
 
@@ -298,7 +351,12 @@ def find_max_minibatch(
         if torch.cuda.is_available():
             torch.cuda.synchronize()
 
-    desc_base = f"shape={input_shape}" if use_input_shape else f"{axis_to_maximize} fixed={fixed_axis}"
+    if use_dsl:
+        desc_base = f"input_shapes search={spec.search_symbol if spec else '?'}"
+    elif use_input_shape:
+        desc_base = f"shape={input_shape}"
+    else:
+        desc_base = f"{axis_to_maximize} fixed={fixed_axis}"
     pbar = tqdm(range(n_attempts), total=n_attempts, desc=desc_base, position=0, leave=True)
     captured_warnings: List[str] = []
     _log_records: List[logging.LogRecord] = []
@@ -453,6 +511,12 @@ def find_max_minibatch(
             final_input_shape = tuple(result if s == -1 else s for s in input_shape)
             tqdm.write(f"\n✅ Final input shape: {final_input_shape}")
             return final_input_shape
+        if use_dsl and spec is not None:
+            shapes_list, _ = materialize_shapes(spec, result, fixed_axis)
+            tqdm.write(f"\n✅ Max {spec.search_symbol} = {result}")
+            for (name, _), sh in zip(inputs_info, shapes_list):
+                tqdm.write(f"   {name}: {sh}")
+            return result
         tqdm.write(f"\n✅ Max value that passed: {result}")
         return result
     tqdm.write("\n❌ No value passed without error.")
