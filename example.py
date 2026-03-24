@@ -73,16 +73,6 @@ def get_two_input_model_with_param() -> TwoInputSummedNormModelWithParam:
 # Two-input DSL examples: tensor argument names in forward order (same as string DSL groups).
 TwoInputForwardParams = ("x", "y")
 
-# HuggingFace causal LM: tensor args to ``forward`` in signature order (after batch_finder skips).
-# Adjust for your checkpoint if ``inspect.signature(model.forward)`` differs.
-HF_CAUSAL_FORWARD_PARAMS = (
-    "input_ids",
-    "attention_mask",
-    "token_type_ids",
-    "position_ids",
-    "labels",
-)
-
 
 def get_distilgpt2():
     from transformers import AutoModelForCausalLM
@@ -148,7 +138,6 @@ if __name__ == "__main__":
                 axis_to_maximize="batch_size",
                 fixed_axis={"seq_len": 32},
                 n_attempts=n_attempts,
-                forward_params=HF_CAUSAL_FORWARD_PARAMS,
             )
             print(f"   Result: Max batch_size = {max_batch_hf}")
 
@@ -159,7 +148,6 @@ if __name__ == "__main__":
                 axis_to_maximize="seq_len",
                 fixed_axis={"batch_size": 2},
                 n_attempts=n_attempts,
-                forward_params=HF_CAUSAL_FORWARD_PARAMS,
             )
             print(f"   Result: Max seq_len = {max_seq_hf}")
         except ImportError:

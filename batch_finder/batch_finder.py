@@ -88,6 +88,17 @@ def _normalize_input_shapes_arg(
     )
 
 
+# Typical HuggingFace causal LM tensor args (``forward``), in signature order for GPT2-style models.
+# Pass ``forward_params=...`` to override when your checkpoint differs.
+DEFAULT_FORWARD_PARAMS_CAUSAL_LM: Tuple[str, ...] = (
+    "input_ids",
+    "attention_mask",
+    "token_type_ids",
+    "position_ids",
+    "labels",
+)
+
+
 def _infer_input_type(param_name: str, dtype_overrides: Optional[Dict[str, str]] = None) -> str:
     """Infer whether an input expects integer or float tensors."""
     if dtype_overrides and param_name in dtype_overrides:
@@ -105,6 +116,74 @@ def _inputs_info_from_names(names: List[str]) -> List[Tuple[str, inspect.Paramet
         (n, inspect.Parameter(n, inspect.Parameter.POSITIONAL_OR_KEYWORD))
         for n in names
     ]
+
+
+# HuggingFace-style ``forward`` kwargs that are not probed as separate tensor slots.
+_SKIP_FORWARD_PARAMS = frozenset(
+    {
+        "return_dict",
+        "output_attentions",
+        "output_hidden_states",
+        "output_router_logits",
+        "output_scores",
+        "output_logits",
+        "use_cache",
+        "past_key_values",
+        "cache_position",
+        "past_bucket_indices",
+        "head_mask",
+        "cross_attn_head_mask",
+        "decoder_head_mask",
+        # Alternate to ``input_ids``; passing both often breaks HF models.
+        "inputs_embeds",
+        "decoder_inputs_embeds",
+    }
+)
+
+
+def _detect_model_inputs(
+    model: torch.nn.Module,
+) -> List[Tuple[str, inspect.Parameter]]:
+    """Tensor-like ``forward`` parameters in signature order (after ``_SKIP_FORWARD_PARAMS``)."""
+    sig = inspect.signature(model.forward)
+    out: List[Tuple[str, inspect.Parameter]] = []
+    for name, p in sig.parameters.items():
+        if name == "self":
+            continue
+        if p.kind in (
+            inspect.Parameter.VAR_POSITIONAL,
+            inspect.Parameter.VAR_KEYWORD,
+        ):
+            continue
+        if name in _SKIP_FORWARD_PARAMS:
+            continue
+        out.append((name, p))
+    return out
+
+
+def _subprocess_probe_worker(
+    result_queue: Any,
+    get_model: Callable[[], torch.nn.Module],
+    cuda_devs: List[int],
+    device_str: str,
+) -> None:
+    """Child entry: one ``get_model()`` call; put ``("ok", config, names)`` or ``("err", msg)``."""
+    try:
+        device = torch.device(device_str)
+        m = get_model()
+        try:
+            cfg = getattr(m, "config", None)
+            names = [n for n, _ in _detect_model_inputs(m)]
+            result_queue.put(("ok", cfg, names))
+        finally:
+            del m
+            gc.collect()
+            _release_memory(device, cuda_devs, aggressive=True)
+    except Exception as e:
+        try:
+            result_queue.put(("err", repr(e)))
+        except Exception:
+            pass
 
 
 def _get_hidden_size_from_config(config: Optional[Any]) -> int:
@@ -183,11 +262,17 @@ def _get_default_shape_for_param(
     return (batch, seq_len)
 
 
-def _default_use_subprocess() -> bool:
+def _default_use_subprocess(device: torch.device) -> bool:
     """
-    On Linux/macOS, run each attempt in a child by default: the parent never holds weights
-    (only ``get_model`` exists in workers). Env ``BATCH_FINDER_SUBPROCESS=0`` forces
-    in-process. Windows always in-process.
+    Linux/macOS: default **subprocess on CUDA** (OOM isolation on the GPU worker).
+
+    Default **in-process on CPU/MPS**: each attempt still builds the model only in this
+    process, but **spawn** would start a **new interpreter per attempt** that reloads
+    HuggingFace weights from scratch — that pattern spikes RAM on shared login nodes and
+    often gets **SIGKILL**'d. Use ``BATCH_FINDER_SUBPROCESS=1`` on CPU if you need a
+    killable worker and have memory headroom.
+
+    Windows: always in-process. Env ``0`` / ``1`` overrides the default.
     """
     if sys.platform == "win32":
         return False
@@ -196,7 +281,7 @@ def _default_use_subprocess() -> bool:
         return False
     if env in ("1", "true", "yes", "on"):
         return True
-    return True
+    return device.type == "cuda"
 
 
 def _process_rss_bytes() -> int:
@@ -373,7 +458,6 @@ def find_max_minibatch(
     ] = None,
     use_subprocess: Optional[bool] = None,
     *,
-    config: Optional[Any] = None,
     forward_params: Optional[Sequence[str]] = None,
 ) -> Optional[Union[int, Tuple[int, ...]]]:
     """
@@ -403,7 +487,12 @@ def find_max_minibatch(
     Args:
         get_model: Callable returning a fresh ``nn.Module`` per attempt (or per subprocess).
             Picklable at top level under ``spawn`` (prefer a module-level function, not a
-            ``lambda``). The parent does not keep weights across attempts.
+            ``lambda``). Before the search loop, batch_finder loads the model **once** to read
+            ``.config`` (if present) and infer ordered ``forward`` tensor argument names (same
+            skips as HuggingFace-style flags). With default subprocess mode on CUDA (Linux/macOS),
+            that probe runs in a **child** so the parent never holds weights. Each attempt still
+            builds a new module; workers **delete** the model and clear CUDA/MPS caches when the
+            attempt finishes.
         axis_to_maximize: Name of axis to maximize when ``input_shapes`` is None.
         fixed_axis: Dict of fixed symbol or axis values (DSL extra symbols or HF-style keys).
         device: Device to run on (default: cuda if available else cpu).
@@ -421,12 +510,15 @@ def find_max_minibatch(
         input_shapes: DSL string, dict (named shapes + ``#constraints``), tuple/list of ints
             with ``-1``, or compact numeric tuple (ints + negative floats, see docstring).
         use_subprocess: If ``True``, each attempt runs in a child (Linux/macOS). If ``False``,
-            in-process. If ``None``, default is subprocess on Linux/macOS (parent has no weights).
-            Env ``BATCH_FINDER_SUBPROCESS`` overrides. Windows always in-process.
-        config: Optional HuggingFace-style config for vocab/hidden/default shapes. If omitted,
-            ``get_model()`` is called once, ``.config`` is read, then the module is discarded.
-        forward_params: Required when ``input_shapes`` is not a dict: ordered tensor argument
-            names for ``forward`` (same order as string DSL groups or ``axis_to_maximize`` inputs).
+            in-process. If ``None``, default is subprocess **on CUDA** only; **CPU/MPS** default
+            is in-process (avoids per-attempt ``spawn`` + full HF reload on login nodes).
+            Env ``BATCH_FINDER_SUBPROCESS=1`` forces subprocess on CPU. Windows: in-process.
+        forward_params: Optional override for ordered ``forward`` tensor argument names when
+            ``input_shapes`` is not a dict. If omitted, names are taken from
+            ``inspect.signature(model.forward)`` (skipping non-input kwargs such as ``use_cache``),
+            then if that is empty and you use ``axis_to_maximize`` only, defaults to
+            :data:`DEFAULT_FORWARD_PARAMS_CAUSAL_LM`. Override when inference misses an argument
+            or order does not match your DSL/tuple.
 
     Returns:
         For int-only tuple/list ``input_shapes``: final shape tuple with each ``-1`` replaced
@@ -446,17 +538,53 @@ def find_max_minibatch(
     if shape_mode is not None and axis_to_maximize is not None:
         raise ValueError("Do not combine input_shapes with axis_to_maximize.")
 
-    if config is None:
+    # Subprocess vs in-process (same rule as the search loop; needed before the probe load).
+    mp_ctx = multiprocessing.get_context("spawn") if sys.platform != "win32" else None
+    mp_ok = bool(
+        mp_ctx is not None
+        and (use_subprocess if use_subprocess is not None else _default_use_subprocess(device))
+    )
+
+    # One load: ``.config`` for vocab / hints + ``forward`` tensor arg names (signature, after skips).
+    # When ``mp_ok``, the probe runs in a child so the parent never holds weights.
+    cfg_effective: Optional[Any] = None
+    probe_detected_names: List[str] = []
+    if mp_ok and mp_ctx is not None:
+        probe_q: Any = mp_ctx.Queue()
+        probe_proc = mp_ctx.Process(
+            target=_subprocess_probe_worker,
+            args=(probe_q, get_model, cuda_devs, str(device)),
+        )
+        probe_proc.start()
+        probe_proc.join()
+        if probe_proc.exitcode != 0:
+            raise RuntimeError(
+                f"batch_finder probe subprocess exited with code {probe_proc.exitcode}"
+            )
+        try:
+            probe_msg: Any = probe_q.get_nowait()
+        except queue.Empty as e:
+            raise RuntimeError("batch_finder probe subprocess returned no result") from e
+        finally:
+            try:
+                probe_q.close()
+                probe_q.join_thread()
+            except Exception:
+                pass
+        if probe_msg[0] == "err":
+            raise RuntimeError(f"batch_finder probe failed: {probe_msg[1]}")
+        _, cfg_effective, probe_detected_names = probe_msg
+    else:
         _probe = get_model()
         try:
-            config = getattr(_probe, "config", None)
+            cfg_effective = getattr(_probe, "config", None)
+            probe_detected_names = [n for n, _ in _detect_model_inputs(_probe)]
         finally:
             del _probe
             gc.collect()
+            _release_memory(device, cuda_devs, aggressive=True)
 
-    cfg_effective = config
-
-    # Forward tensor arguments: dict keys (named DSL) or explicit forward_params
+    # Forward tensor arguments: dict keys, explicit forward_params, then signature probe, then HF default.
     inputs_info: List[Tuple[str, inspect.Parameter]]
     if shape_mode == "dict_dsl":
         assert shape_payload is not None
@@ -468,10 +596,16 @@ def find_max_minibatch(
         inputs_info = _inputs_info_from_names(ordered)
     elif forward_params is not None:
         inputs_info = _inputs_info_from_names(list(forward_params))
+    elif probe_detected_names:
+        inputs_info = _inputs_info_from_names(probe_detected_names)
+    elif axis_to_maximize is not None:
+        inputs_info = _inputs_info_from_names(list(DEFAULT_FORWARD_PARAMS_CAUSAL_LM))
     else:
         raise ValueError(
             "Pass input_shapes as a dict (named DSL), or forward_params=[...] with tensor "
-            "argument names in order (same order as string DSL groups or axis_to_maximize inputs)."
+            "argument names in order (same order as string DSL groups or tuple/compact modes), "
+            "or use axis_to_maximize without input_shapes (default causal-LM names), or ensure "
+            "get_model().forward exposes inferrable tensor parameters."
         )
 
     use_single_shape = shape_mode == "single"
@@ -512,7 +646,14 @@ def find_max_minibatch(
             for i, sh in enumerate(spec.shapes):
                 tqdm.write(f"    [{i}] {tuple(sh)}")
             tqdm.write("  Full forward signature (including skipped params):")
-            tqdm.write("    (not available in parent — pass forward_params / dict keys to match forward)")
+            if probe_detected_names:
+                tqdm.write(
+                    f"    inferred tensor args (after batch_finder skips): {probe_detected_names}"
+                )
+            else:
+                tqdm.write(
+                    "    (none inferred — pass forward_params / dict keys to match forward)"
+                )
             tqdm.write("---\n")
             raise ValueError(
                 f"input_shapes has {len(spec.shapes)} tensor(s) but forward has {len(inputs_info)} tensor argument(s)."
@@ -721,12 +862,7 @@ def find_max_minibatch(
     tgt_frac = min(0.99, max(0.5, float(memory_target_fraction)))
     max_mult = max(1.05, float(max_growth_multiplier))
 
-    # Subprocess: worker holds the only model copy (Linux/macOS default).
-    mp_ctx = multiprocessing.get_context("spawn") if sys.platform != "win32" else None
-    mp_ok = bool(
-        mp_ctx is not None
-        and (use_subprocess if use_subprocess is not None else _default_use_subprocess())
-    )
+    # mp_ctx / mp_ok were computed before the config+signature probe (same subprocess default).
     first_subprocess_run = True
     n_gpus = 0
     for i in pbar:
@@ -784,6 +920,7 @@ def find_max_minibatch(
                         if active is not None:
                             del active
                         gc.collect()
+                        _release_memory(device, cuda_devs, aggressive=True)
                 finally:
                     for _ln in ("transformers", "torch"):
                         for h in logging.getLogger(_ln).handlers[:]:
@@ -857,6 +994,7 @@ def find_max_minibatch(
                         if active_ip is not None:
                             del active_ip
                         gc.collect()
+                        _release_memory(device, cuda_devs, aggressive=True)
                     if err_inner:
                         err_msg_str = err_inner[:60]
                     captured_warnings.extend(str(x.message) for x in w)
