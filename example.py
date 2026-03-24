@@ -59,8 +59,8 @@ if __name__ == "__main__":
 
     experiments_to_run = [
         # 'simple',
-        # 'hf',
-        'two_input',
+        'hf',
+        # 'two_input',
     ]
 
     print("=" * 60)

@@ -4,6 +4,7 @@ Batch Finder - Core functionality for finding maximum batch sizes along variable
 
 import inspect
 import logging
+import numbers
 import sys
 import time
 import warnings
@@ -16,7 +17,9 @@ from tqdm import tqdm
 
 from .input_shapes import (
     InputShapesSpec,
+    materialize_compact_numeric_shape,
     materialize_shapes,
+    normalize_compact_numeric_tuple,
     parse_input_shapes,
     parse_input_shapes_dict,
     collect_symbols_in_shapes,
@@ -24,7 +27,9 @@ from .input_shapes import (
 
 
 def _normalize_input_shapes_arg(
-    input_shapes: Optional[Union[str, Tuple[int, ...], List[int], Dict[str, Any]]],
+    input_shapes: Optional[
+        Union[str, Tuple[Any, ...], List[Any], Dict[str, Any]]
+    ],
 ) -> Tuple[Optional[str], Any]:
     """
     Normalize ``input_shapes`` into a mode and payload.
@@ -34,6 +39,7 @@ def _normalize_input_shapes_arg(
         ("dsl", dsl_string) — parse with ``parse_input_shapes``.
         ("dict_dsl", dict) — parse with ``parse_input_shapes_dict`` after ``inputs_info`` is known.
         ("single", shape_tuple) — one tensor: tuple/list of ints with at least one ``-1``.
+        ("compact", spec_tuple) — one tensor: ints + negative floats (e.g. ``-1.5`` for ``1.5×`` search).
     """
     if input_shapes is None:
         return None, None
@@ -45,11 +51,27 @@ def _normalize_input_shapes_arg(
     if isinstance(input_shapes, Mapping):
         return "dict_dsl", dict(input_shapes)
     if isinstance(input_shapes, (tuple, list)):
+        raw = tuple(input_shapes)
+        has_non_integral = False
+        for x in raw:
+            if isinstance(x, bool):
+                raise TypeError("input_shapes: boolean is not a valid dimension")
+            if isinstance(x, numbers.Integral):
+                continue
+            if isinstance(x, numbers.Real):
+                has_non_integral = True
+                break
+            has_non_integral = True
+            break
+        if has_non_integral:
+            spec = normalize_compact_numeric_tuple(raw)
+            materialize_compact_numeric_shape(spec, 1)
+            return "compact", spec
         try:
-            shape = tuple(int(x) for x in input_shapes)
+            shape = tuple(int(x) for x in raw)
         except (TypeError, ValueError) as e:
             raise TypeError(
-                "When input_shapes is a tuple or list, every element must be an integer "
+                "When input_shapes is a tuple or list of integers, every element must be int-like "
                 "(e.g. dimensions and -1 for the axis to maximize)."
             ) from e
         if -1 not in shape:
@@ -58,7 +80,7 @@ def _normalize_input_shapes_arg(
             )
         return "single", shape
     raise TypeError(
-        f"input_shapes must be str (DSL), dict, tuple of ints, or list of ints; got {type(input_shapes)}"
+        f"input_shapes must be str (DSL), dict, or tuple/list of int/float; got {type(input_shapes)}"
     )
 
 
