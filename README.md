@@ -53,6 +53,16 @@ max_val = find_max_minibatch(model=model, input_shapes=(4, 8, -1))
 max_val = find_max_minibatch(model=model, input_shapes=(-1, 4, -1, 16))
 ```
 
+**Compact numeric tuple (optional, still single-tensor `input_shapes`):** mix **int** sizes with **negative floats** to tie an axis to the searched size without a DSL string. You still need **exactly one integer `-1`** marking the binary‑searched axis. A **negative float** `d` means that dimension’s size is `round(abs(d) * s)`, where `s` is the current trial value for the `-1` axis (e.g. `-1.5` → `1.5×` that size).
+
+```python
+# Search axis 0; axis 2 is always round(1.5 * axis_0)
+max_val = find_max_minibatch(model=model, input_shapes=(-1, 4, -1.5, 16))
+# Same idea as the string DSL "… t=1.5b, b=-1" when only one tensor is involved.
+```
+
+Use **integer** `-1` for the search axis, not `-1.0` (a float is treated as a scale factor). Multi-tensor symbolic layouts still use the **string** (or dict) DSL.
+
 ### Mode 2: `axis_to_maximize` + `fixed_axis` (multi-input models, e.g. HuggingFace)
 
 ```python
@@ -142,7 +152,7 @@ Find the maximum value for the modifiable axis without OOM.
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `model` | `torch.nn.Module` | – | PyTorch or HuggingFace model |
-| `input_shapes` | `str` \| `dict` \| `Tuple[int, ...]` \| `List[int]` | `None` | **String:** multi-tensor DSL (Mode 3). **Dict:** named shapes + `"#constraints"` (Mode 3b). **Tuple/list:** single first `forward` arg, must include `-1` (Mode 1). Mutually exclusive with `axis_to_maximize` |
+| `input_shapes` | `str` \| `dict` \| tuple/list | `None` | **String:** multi-tensor DSL (Mode 3). **Dict:** named shapes + `"#constraints"` (Mode 3b). **Tuple/list:** single first `forward` arg — all-**int** with `-1`, or **compact numeric** with one int `-1` and negative **floats** for scaled axes (e.g. `-1.5` → `1.5×` search). Mutually exclusive with `axis_to_maximize` |
 | `axis_to_maximize` | `str` | `None` | Axis name when `input_shapes` is omitted, e.g. `"batch_size"` |
 | `fixed_axis` | `Dict[str, int]` | `{}` | Fixed values, e.g. `{"seq_len": 128}` |
 | `device` | `torch.device` | auto | Device to run on |
@@ -156,7 +166,7 @@ Find the maximum value for the modifiable axis without OOM.
 **Returns:** `Tuple[int, ...]` (when using tuple/list `input_shapes`), `int` (when using DSL string or `axis_to_maximize`), or `None` if nothing succeeded.
 
 **Modes:**
-- Provide `input_shapes` as tuple/list: uses first input param with the given shape; `-1` = variable axis.
+- Provide `input_shapes` as tuple/list: uses first input param; `-1` = variable axis (all ints), or compact numeric tuple with negative floats for scaled axes.
 - Provide `input_shapes` as string: one shape tuple per `forward` tensor; symbolic names + `symbol=-1` + optional constraints.
 - Provide `input_shapes` as dict: same as string DSL, with keys = parameter names and `"#constraints"` for constraints.
 - Provide `axis_to_maximize` + `fixed_axis`: builds inputs from detected params and conventions.

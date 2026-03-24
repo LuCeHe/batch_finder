@@ -234,7 +234,9 @@ def find_max_minibatch(
     inference_only: bool = False,
     factor_down: float = 2.0,
     factor_up: float = 2.0,
-    input_shapes: Optional[Union[str, Tuple[int, ...], List[int], Dict[str, Any]]] = None,
+    input_shapes: Optional[
+        Union[str, Tuple[Any, ...], List[Any], Dict[str, Any]]
+    ] = None,
 ) -> Optional[Union[int, Tuple[int, ...]]]:
     """
     Find the maximum value for the modifiable axis that the model can process without OOM.
@@ -247,9 +249,10 @@ def find_max_minibatch(
     2. **Dict (named DSL):** keys are ``forward`` parameter names; values are shape strings
        like ``\"(b, t), int\"`` or ``\"(d, b, t)\"``; include ``\"#constraints\"`` for
        constraints (e.g. ``\"t=2b, b=-1\"``). Clearer for models with many arguments.
-    3. **Tuple or list of ints:** single first forward argument only; must include at least
-       one ``-1`` for the axis to maximize.
-       Example: ``(-1, 64, 256)`` or ``[4, 8, -1]``.
+    3. **Tuple or list (single tensor):** only the first ``forward`` argument; must include
+       at least one ``-1`` (all ints), **or** a **compact numeric** tuple mixing ``int`` and
+       negative ``float`` factors (e.g. ``(-1, 4, -1.5, 16)`` means axis 2 has size
+       ``round(1.5 * s)`` where ``s`` is the searched size at ``-1``).
     4. **axis_to_maximize + fixed_axis:** when ``input_shapes`` is omitted; for multi-input
        models (e.g. HuggingFace) by symbolic axis name.
 
@@ -267,11 +270,13 @@ def find_max_minibatch(
         inference_only: If True, skip forward gradients and backward pass. If False, runs full forward+backward.
         factor_down: On failure, next = value / factor_down (default 2).
         factor_up: On success, next = value * factor_up (default 2).
-        input_shapes: DSL string, dict (named shapes + ``#constraints``), or
-            tuple/list of ints with ``-1`` for single-tensor mode.
+        input_shapes: DSL string, dict (named shapes + ``#constraints``), tuple/list of ints
+            with ``-1``, or compact numeric tuple (ints + negative floats, see docstring).
 
     Returns:
-        For tuple/list ``input_shapes``: final shape tuple with ``-1`` replaced by the max value.
+        For int-only tuple/list ``input_shapes``: final shape tuple with each ``-1`` replaced
+            by the max value.
+        For compact numeric ``input_shapes``: final materialized shape tuple (ints only).
         For DSL string or ``axis_to_maximize``: int (max symbol or axis value).
         None if no value succeeded.
     """
@@ -290,7 +295,11 @@ def find_max_minibatch(
         raise ValueError("Could not detect model inputs from forward signature.")
 
     use_single_shape = shape_mode == "single"
+    use_compact_shape = shape_mode == "compact"
     single_shape: Optional[Tuple[int, ...]] = shape_payload if use_single_shape else None
+    compact_spec: Optional[Tuple[Union[int, float], ...]] = (
+        shape_payload if use_compact_shape else None
+    )
     spec: Optional[InputShapesSpec] = None
     dtype_overrides: Optional[Dict[str, str]] = None
 
@@ -340,7 +349,7 @@ def find_max_minibatch(
                 f"search symbol {spec.search_symbol!r} must appear in at least one shape tuple."
             )
 
-    if not use_dsl and not use_single_shape and not axis_to_maximize:
+    if not use_dsl and not use_single_shape and not use_compact_shape and not axis_to_maximize:
         raise ValueError("Must provide input_shapes or axis_to_maximize.")
 
     modifiable_axis_idxs = (
@@ -348,7 +357,9 @@ def find_max_minibatch(
         if (use_single_shape and single_shape)
         else []
     )
-    shape_param_name = inputs_info[0][0] if use_single_shape else None
+    shape_param_name = (
+        inputs_info[0][0] if (use_single_shape or use_compact_shape) else None
+    )
 
     # Build sample axis_values for size estimation
     _sample_axis_values = {**fixed_axis}
@@ -357,6 +368,10 @@ def find_max_minibatch(
         _sample_axis_values.update(binds)
     elif use_single_shape and single_shape is not None:
         _sample_shape = tuple(initial_value if s == -1 else s for s in single_shape)
+        _sample_axis_values["batch_size"] = _sample_shape[0] if _sample_shape else initial_value
+        _sample_axis_values["seq_len"] = _sample_shape[1] if len(_sample_shape) > 1 else 64
+    elif use_compact_shape and compact_spec is not None:
+        _sample_shape = materialize_compact_numeric_shape(compact_spec, initial_value)
         _sample_axis_values["batch_size"] = _sample_shape[0] if _sample_shape else initial_value
         _sample_axis_values["seq_len"] = _sample_shape[1] if len(_sample_shape) > 1 else 64
     else:
@@ -368,6 +383,8 @@ def find_max_minibatch(
         if use_dsl and spec is not None:
             shapes_list, _ = materialize_shapes(spec, initial_value, fixed_axis)
             shape = shapes_list[idx]
+        elif use_compact_shape and idx == 0 and compact_spec is not None:
+            shape = materialize_compact_numeric_shape(compact_spec, initial_value)
         elif use_single_shape and idx == 0 and single_shape is not None:
             shape = tuple(initial_value if s == -1 else s for s in single_shape)
         else:
@@ -391,6 +408,27 @@ def find_max_minibatch(
                 else:
                     inputs[param_name] = torch.randn(
                         shape, device=device, requires_grad=_float_requires_grad
+                    )
+        elif use_compact_shape and compact_spec is not None:
+            shape = materialize_compact_numeric_shape(compact_spec, value)
+            dtype = _infer_input_type(shape_param_name)
+            if dtype == "integer":
+                vocab = getattr(getattr(model, "config", None), "vocab_size", None) or 50257
+                inputs[shape_param_name] = torch.randint(0, min(vocab, 1000), shape, device=device, dtype=torch.long)
+            else:
+                inputs[shape_param_name] = torch.randn(
+                    shape, device=device, requires_grad=_float_requires_grad
+                )
+            for param_name, _ in inputs_info[1:]:
+                axis_values = {"batch_size": shape[0] if len(shape) >= 1 else value, "seq_len": shape[1] if len(shape) >= 2 else 64}
+                p_shape = _get_default_shape_for_param(param_name, model, axis_values)
+                p_dtype = _infer_input_type(param_name)
+                if p_dtype == "integer":
+                    vocab = getattr(getattr(model, "config", None), "vocab_size", None) or 50257
+                    inputs[param_name] = torch.randint(0, min(vocab, 1000), p_shape, device=device, dtype=torch.long)
+                else:
+                    inputs[param_name] = torch.randn(
+                        p_shape, device=device, requires_grad=_float_requires_grad
                     )
         elif use_single_shape and single_shape is not None:
             shape = list(single_shape)
@@ -464,6 +502,8 @@ def find_max_minibatch(
 
     if use_dsl:
         desc_base = f"input_shapes search={spec.search_symbol if spec else '?'}"
+    elif use_compact_shape and compact_spec is not None:
+        desc_base = f"input_shapes={compact_spec!r}"
     elif use_single_shape:
         desc_base = f"shape={single_shape}"
     else:
@@ -618,6 +658,10 @@ def find_max_minibatch(
 
     if successful:
         result = max(successful)
+        if use_compact_shape and compact_spec is not None:
+            final_input_shape = materialize_compact_numeric_shape(compact_spec, result)
+            tqdm.write(f"\n✅ Final input shape: {final_input_shape}")
+            return final_input_shape
         if use_single_shape and single_shape is not None:
             final_input_shape = tuple(result if s == -1 else s for s in single_shape)
             tqdm.write(f"\n✅ Final input shape: {final_input_shape}")

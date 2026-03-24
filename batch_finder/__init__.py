@@ -10,7 +10,9 @@ from .input_shapes import (
     CONSTRAINTS_KEY,
     FINDER_CONSTRAINTS_KEY,
     InputShapesSpec,
+    materialize_compact_numeric_shape,
     materialize_shapes,
+    normalize_compact_numeric_tuple,
     parse_input_shapes,
     parse_input_shapes_dict,
 )
@@ -24,5 +26,7 @@ __all__ = [
     "FINDER_CONSTRAINTS_KEY",
     "InputShapesSpec",
     "materialize_shapes",
+    "materialize_compact_numeric_shape",
+    "normalize_compact_numeric_tuple",
 ]
 

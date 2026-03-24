@@ -2,6 +2,12 @@
 Example usage of batch_finder package.
 """
 
+import sys
+from pathlib import Path
+
+# Prefer this repo when running `python example.py` (avoids an older `batch_finder` on PYTHONPATH).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 import argparse
 import torch
 import torch.nn as nn
