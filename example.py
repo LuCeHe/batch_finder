@@ -148,7 +148,7 @@ if __name__ == "__main__":
             max_seq_hf = find_max_minibatch(
                 get_distilgpt2,
                 axis_to_maximize="seq_len",
-                fixed_axis={"batch_size": 2},
+                fixed_axis={"batch_size": 32},
                 n_attempts=n_attempts,
             )
             print(f"   Result: Max seq_len = {max_seq_hf}")
