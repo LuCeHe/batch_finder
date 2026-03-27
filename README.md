@@ -4,9 +4,7 @@
 
 **Find the maximum value for any dimension your PyTorch models can handle without running out of memory.**
 
-
 Batch Finder detects your model’s inputs (types and shapes), fixes the sizes you choose, and searches for the largest value that still fits in memory.
-
 
 
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
@@ -17,67 +15,37 @@ Batch Finder detects your model’s inputs (types and shapes), fixes the sizes y
 
 ## ✨ Features
 
-
-
 - 🎯 **One API** – `find_max_minibatch` for all workflows
-
 - 🔍 **Explicit inputs** – Names, dtypes, and rough shapes from `input_shapes` / `forward_params`, plus `get_model().config` when available
-
 - 📐 **Shapes** – Tuple/list for a single tensor, text or dict when `forward` takes several tensors, or `axis_to_maximize` + `fixed_axis`
-
 - 🚀 **Inference or training** – With or without backward
-
 - ⚙️ **Tunable search** – `factor_down`, `factor_up`, `n_attempts`, `initial_value`
-
 - 🛡️ **Safe runs** – Cleans up after failures; returns `None` if even size `1` fails
-
 - 📊 **Progress** – tqdm with status in the bar
-
-
 
 ## 📦 Installation
 
 
 
 ```bash
-
 pip install batch-finder
-
 ```
-
-
 
 Or from source:
 
-
-
 ```bash
-
 git clone https://github.com/yourusername/batch-finder.git
-
 cd batch-finder
-
 pip install -e .
-
 ```
-
-
 
 ## 🚀 Quick Start
 
-
-
 ### One tensor: tuple or list
-
-
 
 Use **negative integers** `-1` on each axis you want to maximize (the search tries a single trial size each step). In an **all-integer** tuple, every `-1` position shares that same trial size. Use positive integers for fixed dimensions.
 
-
-
 If the tuple mixes integers and **negative floats**, you are in **compact numeric** mode: there must be **exactly one** integer `-1` (the searched axis). Any other dimension given as a **negative float** `-x` is sized as `round(|x| × trial)`, where `trial` is the current value on the `-1` axis—so `|x|` is the proportion you want between that axis and the searched axis (e.g. `-1.5` keeps that dim about 1.5× the trial size). Do not use `-1.0` for the search axis (use integer `-1`).
-
-
 
 ```python
 from batch_finder import find_max_minibatch
