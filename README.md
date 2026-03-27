@@ -74,7 +74,11 @@ pip install -e .
 
 
 
-Use `-1` on the axis you want to maximize; use positive integers everywhere else.
+Use **negative integers** `-1` on each axis you want to maximize (the search tries a single trial size each step). In an **all-integer** tuple, every `-1` position shares that same trial size. Use positive integers for fixed dimensions.
+
+
+
+If the tuple mixes integers and **negative floats**, you are in **compact numeric** mode: there must be **exactly one** integer `-1` (the searched axis). Any other dimension given as a **negative float** `-x` is sized as `round(|x| × trial)`, where `trial` is the current value on the `-1` axis—so `|x|` is the proportion you want between that axis and the searched axis (e.g. `-1.5` keeps that dim about 1.5× the trial size). Do not use `-1.0` for the search axis (use integer `-1`).
 
 
 
@@ -102,25 +106,7 @@ max_val = find_max_minibatch(get_model, input_shapes=(4, 8, -1))
 
 
 
-# Several -1: all those axes use the same trial size
-
-max_val = find_max_minibatch(get_model, input_shapes=(-1, 4, -1, 16))
-
-```
-
-
-
-**Scaled axis with `-1.5`:** use a **negative float** so that dimension is `round(1.5 ×` the current trial size for the integer `-1` axis). You must keep **exactly one integer `-1`** (the searched axis). Example: axis 2 is always about 1.5× axis 0.
-
-
-
-```python
-
-def get_model():
-
-    return MyModel()
-
-
+# One integer -1 (searched axis) + negative float: other dims scale by |float| vs. that trial
 
 max_val = find_max_minibatch(get_model, input_shapes=(-1, 4, -1.5, 16))
 
@@ -128,7 +114,7 @@ max_val = find_max_minibatch(get_model, input_shapes=(-1, 4, -1.5, 16))
 
 
 
-Use integer `-1` for the search axis, not `-1.0` (floats other than negative scales are treated as multipliers). For several input tensors, use a string or dict below.
+For several input tensors, use a string or dict below.
 
 
 
@@ -274,7 +260,7 @@ max_b = find_max_minibatch(
 
 
 
-Import `CONSTRAINTS_KEY` from `batch_finder` (same as `"#constraints"`). `FINDER_CONSTRAINTS_KEY` is an alias.
+Use the literal `"#constraints"` for the rules entry, or import `FINDER_CONSTRAINTS_KEY` from `batch_finder` to avoid typos (`CONSTRAINTS_KEY` is the same string, kept for compatibility).
 
 
 

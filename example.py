@@ -71,7 +71,7 @@ def get_two_input_model_with_param() -> TwoInputSummedNormModelWithParam:
 
 
 # Two-input DSL examples: tensor argument names in forward order (same as string DSL groups).
-TwoInputForwardParams = ("x", "y")
+# TwoInputForwardParams = ("x", "y")
 
 
 def get_distilgpt2():
@@ -86,9 +86,9 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     experiments_to_run = [
-        # 'simple',
+        'simple',
         'hf',
-        # 'two_input',
+        'two_input',
     ]
 
     print("=" * 60)
@@ -121,7 +121,7 @@ if __name__ == "__main__":
         print("\n1c. SimpleModel input_shapes=(-1, 4, -1, 16)...")
         res_1c = find_max_minibatch(
             get_simple_model,
-            input_shapes=(-1, 4, -1.3, 16),
+            input_shapes=(-1., 4, -1.3, 16),
             n_attempts=n_attempts_non_hf,
         )
         print(f"   Result: Final input shape = {res_1c}")
@@ -161,9 +161,9 @@ if __name__ == "__main__":
         res_3 = find_max_minibatch(
             get_two_input_model,
             input_shapes=dsl,
-            inference_only=False,
+            # inference_only=False,
             n_attempts=n_attempts_non_hf,
-            forward_params=TwoInputForwardParams,
+            # forward_params=TwoInputForwardParams,
         )
         print(f"   Result: max b = {res_3}")
 
@@ -172,9 +172,9 @@ if __name__ == "__main__":
         res_4 = find_max_minibatch(
             get_two_input_model_with_param,
             input_shapes=dsl,
-            inference_only=False,
+            # inference_only=False,
             n_attempts=n_attempts_non_hf,
-            forward_params=TwoInputForwardParams,
+            # forward_params=TwoInputForwardParams,
         )
         print(f"   Result: max b = {res_4}")
 
