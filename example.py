@@ -70,10 +70,6 @@ def get_two_input_model_with_param() -> TwoInputSummedNormModelWithParam:
     return TwoInputSummedNormModelWithParam()
 
 
-# Two-input DSL examples: tensor argument names in forward order (same as string DSL groups).
-# TwoInputForwardParams = ("x", "y")
-
-
 def get_distilgpt2():
     from transformers import AutoModelForCausalLM
 
@@ -82,7 +78,13 @@ def get_distilgpt2():
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Batch Finder Examples")
-    parser.add_argument("--n-attempts", "-n", type=int, default=2, help="Max attempts per test (default: 50)")
+    parser.add_argument(
+        "--n-attempts",
+        "-n",
+        type=int,
+        default=50,
+        help="Max attempts per find_max_minibatch call (default: 50)",
+    )
     args = parser.parse_args()
 
     experiments_to_run = [
@@ -170,9 +172,7 @@ if __name__ == "__main__":
         res_4 = find_max_minibatch(
             get_two_input_model_with_param,
             input_shapes=dsl,
-            # inference_only=False,
             n_attempts=n_attempts_non_hf,
-            # forward_params=TwoInputForwardParams,
         )
         print(f"   Result: max b = {res_4}")
 

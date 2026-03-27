@@ -8,6 +8,7 @@ import logging
 import numbers
 import os
 import queue
+import signal
 import sys
 import time
 import warnings
@@ -268,17 +269,30 @@ def _get_default_shape_for_param(
     return (batch, seq_len)
 
 
-def _default_use_subprocess(device: torch.device) -> bool:
+def _describe_subprocess_exitcode(code: Optional[int]) -> str:
+    """Human-readable child exit code (negative values are ``-signal`` on POSIX)."""
+    if code is None:
+        return "?"
+    if code >= 0:
+        return str(code)
+    sig = -code
+    try:
+        return f"{code} ({signal.Signals(sig).name})"
+    except (ValueError, AttributeError):
+        return str(code)
+
+
+def _default_use_subprocess(_device: torch.device) -> bool:
     """
-    Linux/macOS: default **subprocess on CUDA** (OOM isolation on the GPU worker).
+    Linux/macOS: default **subprocess** for CUDA, CPU, and MPS.
 
-    Default **in-process on CPU/MPS**: each attempt still builds the model only in this
-    process, but **spawn** would start a **new interpreter per attempt** that reloads
-    HuggingFace weights from scratch — that pattern spikes RAM on shared login nodes and
-    often gets **SIGKILL**'d. Use ``BATCH_FINDER_SUBPROCESS=1`` on CPU if you need a
-    killable worker and have memory headroom.
+    Each attempt runs in a **child** so host OOM (SIGKILL) or CUDA OOM handling does not
+    terminate the parent interpreter—only the worker dies and the search continues.
 
-    Windows: always in-process. Env ``0`` / ``1`` overrides the default.
+    Set ``BATCH_FINDER_SUBPROCESS=0`` for **in-process** attempts (e.g. shared login nodes
+    where repeated full HF reloads per spawn are worse than one process).
+
+    Windows: always in-process (no attempt subprocess). Env is ignored except for docs.
     """
     if sys.platform == "win32":
         return False
@@ -287,7 +301,7 @@ def _default_use_subprocess(device: torch.device) -> bool:
         return False
     if env in ("1", "true", "yes", "on"):
         return True
-    return device.type == "cuda"
+    return True
 
 
 def _process_rss_bytes() -> int:
@@ -495,7 +509,7 @@ def find_max_minibatch(
             Picklable at top level under ``spawn`` (prefer a module-level function, not a
             ``lambda``). Before the search loop, batch_finder loads the model **once** to read
             ``.config`` (if present) and infer ordered ``forward`` tensor argument names (same
-            skips as HuggingFace-style flags). With default subprocess mode on CUDA (Linux/macOS),
+            skips as HuggingFace-style flags). With default subprocess mode (Linux/macOS),
             that probe runs in a **child** so the parent never holds weights. Each attempt still
             builds a new module; workers **delete** the model and clear CUDA/MPS caches when the
             attempt finishes.
@@ -516,9 +530,9 @@ def find_max_minibatch(
         input_shapes: DSL string, dict (named shapes + ``#constraints``), tuple/list of ints
             with ``-1``, or compact numeric tuple (ints + negative floats, see docstring).
         use_subprocess: If ``True``, each attempt runs in a child (Linux/macOS). If ``False``,
-            in-process. If ``None``, default is subprocess **on CUDA** only; **CPU/MPS** default
-            is in-process (avoids per-attempt ``spawn`` + full HF reload on login nodes).
-            Env ``BATCH_FINDER_SUBPROCESS=1`` forces subprocess on CPU. Windows: in-process.
+            in-process. If ``None``, default is subprocess on **CUDA, CPU, and MPS** (worker
+            may be OOM-killed without killing the parent). Set ``BATCH_FINDER_SUBPROCESS=0``
+            for in-process on memory-tight hosts. Windows: in-process.
         forward_params: Optional override for ordered ``forward`` tensor argument names when
             ``input_shapes`` is not a dict. If omitted, names are taken from
             ``inspect.signature(model.forward)`` (skipping non-input kwargs such as ``use_cache``),
@@ -870,6 +884,7 @@ def find_max_minibatch(
 
     # mp_ctx / mp_ok were computed before the config+signature probe (same subprocess default).
     first_subprocess_run = True
+    _logged_subprocess_sigkill = False
     n_gpus = 0
     for i in pbar:
         value_i = max(1, current_value)
@@ -953,7 +968,18 @@ def find_max_minibatch(
                         peak_gpu_attempt = {cuda_devs[0]: int(res[5])}
                     rss_delta_attempt = int(res[6]) if len(res) > 6 else 0
                 else:
-                    err_msg_str = f"Killed (exitcode {proc.exitcode})" if proc.exitcode else "Process died"
+                    ec = proc.exitcode
+                    err_msg_str = (
+                        f"worker exit {_describe_subprocess_exitcode(ec)}"
+                        if ec is not None
+                        else "Process died"
+                    )
+                    if ec is not None and ec < 0 and not _logged_subprocess_sigkill:
+                        _logged_subprocess_sigkill = True
+                        tqdm.write(
+                            "batch_finder: subprocess worker was terminated (often host OOM); "
+                            "parent continues the search."
+                        )
             except Exception:
                 mp_ok = False
             else:
