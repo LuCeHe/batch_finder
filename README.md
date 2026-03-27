@@ -1,6 +1,6 @@
 <h1 align="center">🔍 Batch Finder</h1>
 
-<p align="center"><strong>Find the maximum value for any dimension your PyTorch models can handle without running out of memory.</strong></p>
+<p align="center"><strong>Find the maximum value for any dimension your PyTorch models can handle without stopping the code.</strong></p>
 
 <p align="center">
   <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.8+-blue.svg" alt="Python 3.8+"></a>
@@ -8,7 +8,7 @@
   <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT"></a>
 </p>
 
-Batch Finder detects your model’s inputs (types and shapes), fixes the sizes you choose, and searches for the largest value that still fits in memory.
+Batch Finder detects your model’s inputs (types and shapes), fixes the sizes you choose, and searches for the largest value your run can sustain without stopping the code.
 
 
 
@@ -16,7 +16,7 @@ Batch Finder detects your model’s inputs (types and shapes), fixes the sizes y
 
 - 🎯 **One API** – `find_max_minibatch` for all workflows
 - 🔍 **Explicit inputs** – Names, dtypes, and rough shapes from `input_shapes` / `forward_params`, plus `get_model().config` when available
-- 📐 **Shapes** – Tuple/list for a single tensor, text or dict when `forward` takes several tensors, or `axis_to_maximize` + `fixed_axis`
+- 📐 **Shapes** – Flat tuple/list or **list of tuples** per tensor (e.g. `[(-1, 128, 512), (-1, 128, 512)]`), text or dict when `forward` takes several tensors, or `axis_to_maximize` + `fixed_axis`
 - 🚀 **Inference or training** – With or without backward
 - ⚙️ **Tunable search** – `factor_down`, `factor_up`, `n_attempts`, `initial_value`
 - 🛡️ **Safe runs** – Cleans up after failures; returns `None` if even size `1` fails
@@ -44,6 +44,8 @@ pip install -e .
 
 Use **negative integers** `-1` on each axis you want to maximize (the search tries a single trial size each step). In an **all-integer** tuple, every `-1` position shares that same trial size. Use positive integers for fixed dimensions.
 
+Other **negative integers** `d < -1` (e.g. `-2`, `-3`) size that dimension as `round(|d| × trial)`—the same scaling role as negative floats below (e.g. `-2` → 2× the trial size tied to `-1`).
+
 If the tuple mixes integers and **negative floats**, you are in **compact numeric** mode: there must be **at least one** integer `-1` (the searched axis). Any other dimension given as a **negative float** `-x` is sized as `round(|x| × trial)`, where `trial` is the current value on the `-1` axis—so `|x|` is the proportion you want between that axis and the searched axis (e.g. `-1.5` keeps that dim about 1.5× the trial size).
 
 ```python
@@ -62,7 +64,20 @@ max_val = find_max_minibatch(get_model, input_shapes=(4, 8, -1))
 max_val = find_max_minibatch(get_model, input_shapes=(-1, 4, -1.5, 16))
 ```
 
-For several input tensors, use a string or dict below.
+### Several tensors: list of shape tuples
+
+Pass a **list or tuple of per-tensor shapes** (same order as `forward` / `forward_params`). Each entry follows the same rules as a single-tensor tuple (integer `-1`, integer multipliers `-2`, `-3`, …, or compact floats). **One** trial size is searched; every `-1` and every `d < -1` uses that trial value as above.
+
+```python
+# Example: two tensors, same free shape pattern
+max_val = find_max_minibatch(
+    get_model,
+    input_shapes=[(-1, 128, 512), (-1, 128, 512)],
+    forward_params=["x", "y"],
+)
+```
+
+For symbolic names and constraints across tensors, use a string or dict below.
 
 ### HuggingFace-style: `axis_to_maximize` + `fixed_axis`
 
@@ -170,7 +185,7 @@ Find the largest workable size for the free axis without OOM.
 |-----------|------|---------|-------------|
 | `get_model` | `Callable[[], nn.Module]` | (required) | **First argument.** Fresh module per attempt. Parent calls `get_model()` **once** first, keeps only `.config` (if any) for vocab/shape hints, then drops weights. Picklable under `spawn` (module-level function, not `lambda`) |
 | `forward_params` | `Sequence[str]` | `None` | When `input_shapes` is not a dict: ordered tensor names for `forward`. With **`axis_to_maximize`** only, defaults to **`DEFAULT_FORWARD_PARAMS_CAUSAL_LM`** (GPT2-style). Override or import that constant to tweak. |
-| `input_shapes` | `str` \| `dict` \| tuple/list | `None` | **String:** several tensors, shared names and rules. **Dict:** named shapes + `"#constraints"`. **Tuple/list:** first tensor only — all ints with `-1`, or one int `-1` plus negative floats (e.g. `-1.5` → 1.5× the trial size on that axis). Not used together with `axis_to_maximize` |
+| `input_shapes` | `str` \| `dict` \| tuple/list | `None` | **String:** several tensors, shared names and rules. **Dict:** named shapes + `"#constraints"`. **Flat tuple/list:** first tensor only (ints with `-1` or compact floats). **Nested list/tuple of shapes:** one tuple per tensor, e.g. `[(-1, 128, 512), (-1, 128, 512)]`. Not used together with `axis_to_maximize` |
 | `axis_to_maximize` | `str` | `None` | Name of the axis when `input_shapes` is omitted, e.g. `"batch_size"` |
 | `fixed_axis` | `Dict[str, int]` | `{}` | Fixed sizes, e.g. `{"seq_len": 128}` |
 | `device` | `torch.device` | auto | Device to run on |
@@ -186,11 +201,11 @@ Find the largest workable size for the free axis without OOM.
 | `cuda_mem_devices` | `int`, list, or `"all"` | `None` | Which GPUs to read peak memory on; default = search `device`’s index. `"all"` or `[0,1,…]` for multi-GPU bottleneck |
 | `use_subprocess` | `bool` | `None` | Default: subprocess on **Linux/macOS** for CUDA, CPU, and MPS (worker may be OOM-killed; parent continues). Set ``BATCH_FINDER_SUBPROCESS=0`` for in-process on very tight hosts. Windows: in-process |
 
-**Returns:** Shape tuple (tuple/list `input_shapes`), or `int` (string/dict `input_shapes` or `axis_to_maximize`), or `None` if nothing worked.
+**Returns:** Shape tuple, **tuple of shape tuples** (multi-tensor list `input_shapes`), or `int` (string/dict `input_shapes` or `axis_to_maximize`), or `None` if nothing worked.
 
 **Modes:**
 
-- **Tuple/list:** first `forward` argument; `-1` marks the free axis, or add negative floats to scale other axes off that trial size.
+- **Tuple/list:** first `forward` argument, or a **list/tuple of shape tuples** for several arguments; `-1` marks the free axis, or add negative floats to scale other axes off that trial size.
 - **String:** one shape group per tensor; names, one `=-1`, optional equations between names.
 - **Dict:** like the string form, keys = parameter names, `"#constraints"` for the rules.
 - **`axis_to_maximize` + `fixed_axis`:** when you skip `input_shapes`.

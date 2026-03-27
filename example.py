@@ -88,9 +88,9 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     experiments_to_run = [
-        'simple',
-        'hf',
-        # 'two_input',
+        # 'simple',
+        # 'hf',
+        'two_input',
     ]
 
     print("=" * 60)
@@ -175,6 +175,20 @@ if __name__ == "__main__":
             n_attempts=n_attempts_non_hf,
         )
         print(f"   Result: max b = {res_4}")
+
+
+        # 5: Same model — list of int shapes: -1 = searched axis (b), -2 = 2× trial (t), like t=2b
+        print(
+            "\n5. TwoInputSummedNormModel — input_shapes "
+            "[(23, -1, -2, 45), (-1, -2, 12)]"
+        )
+        res_5 = find_max_minibatch(
+            get_two_input_model,
+            input_shapes=[(23, -1, -2, 45), (-1, -2, 12)],
+            forward_params=["x", "y"],
+            n_attempts=n_attempts_non_hf,
+        )
+        print(f"   Result (final shapes, max trial b): {res_5}")
 
     print("\n" + "=" * 60)
     print("Examples completed!")

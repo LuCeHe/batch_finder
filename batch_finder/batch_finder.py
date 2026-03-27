@@ -31,6 +31,63 @@ from .input_shapes import (
 )
 
 
+def _materialize_int_shape_slots(shape: Tuple[int, ...], trial: int) -> Tuple[int, ...]:
+    """
+    Integer-only shape template: ``-1`` → ``trial``; ``d < -1`` → ``round(|d| * trial)`` (e.g. ``-2`` → ``2×`` trial);
+    non-negative dims unchanged. Same scaling role as negative floats in compact mode.
+    """
+    out: List[int] = []
+    for s in shape:
+        if s == -1:
+            out.append(trial)
+        elif s < -1:
+            out.append(int(round(abs(s) * trial)))
+        else:
+            out.append(s)
+    return tuple(out)
+
+
+def _parse_flat_shape_tuple(
+    raw: Tuple[Any, ...],
+) -> Tuple[str, Tuple[Any, ...]]:
+    """
+    One tensor: int-only ``single`` shape or ``compact`` numeric tuple.
+
+    Int-only: at least one ``-1`` (searched axis). Other negative ints ``d < -1`` scale like
+    compact floats: dimension ``round(|d| * trial)`` (e.g. ``-2`` → ``2×`` trial).
+
+    Returns:
+        ``("single", shape_ints)`` or ``("compact", spec)`` (same as ``normalize_compact_numeric_tuple`` output).
+    """
+    has_non_integral = False
+    for x in raw:
+        if isinstance(x, bool):
+            raise TypeError("input_shapes: boolean is not a valid dimension")
+        if isinstance(x, numbers.Integral):
+            continue
+        if isinstance(x, numbers.Real):
+            has_non_integral = True
+            break
+        has_non_integral = True
+        break
+    if has_non_integral:
+        spec = normalize_compact_numeric_tuple(raw)
+        materialize_compact_numeric_shape(spec, 1)
+        return "compact", spec
+    try:
+        shape = tuple(int(x) for x in raw)
+    except (TypeError, ValueError) as e:
+        raise TypeError(
+            "When input_shapes is a tuple or list of integers, every element must be int-like "
+            "(e.g. dimensions and -1 for the axis to maximize)."
+        ) from e
+    if -1 not in shape:
+        raise ValueError(
+            "tuple/list input_shapes must contain at least one -1 for the modifiable axis."
+        )
+    return "single", shape
+
+
 def _normalize_input_shapes_arg(
     input_shapes: Optional[
         Union[str, Tuple[Any, ...], List[Any], Dict[str, Any]]
@@ -45,6 +102,7 @@ def _normalize_input_shapes_arg(
         ("dict_dsl", dict) — parse with ``parse_input_shapes_dict`` after ``inputs_info`` is known.
         ("single", shape_tuple) — one tensor: tuple/list of ints with at least one ``-1``.
         ("compact", spec_tuple) — one tensor: ints + negative floats; searched axis is ``-1`` (int) or ``-1.0`` / ``-1.`` (float); other negative floats scale (e.g. ``-1.5`` → ``1.5×`` trial).
+        ("multi_shape", list of (mode, payload)) — several tensors: same order as ``forward`` / ``forward_params``; each entry is ``("single", ...)`` or ``("compact", ...)`` from ``_parse_flat_shape_tuple``.
     """
     if input_shapes is None:
         return None, None
@@ -56,34 +114,20 @@ def _normalize_input_shapes_arg(
     if isinstance(input_shapes, Mapping):
         return "dict_dsl", dict(input_shapes)
     if isinstance(input_shapes, (tuple, list)):
-        raw = tuple(input_shapes)
-        has_non_integral = False
-        for x in raw:
-            if isinstance(x, bool):
-                raise TypeError("input_shapes: boolean is not a valid dimension")
-            if isinstance(x, numbers.Integral):
-                continue
-            if isinstance(x, numbers.Real):
-                has_non_integral = True
-                break
-            has_non_integral = True
-            break
-        if has_non_integral:
-            spec = normalize_compact_numeric_tuple(raw)
-            materialize_compact_numeric_shape(spec, 1)
-            return "compact", spec
-        try:
-            shape = tuple(int(x) for x in raw)
-        except (TypeError, ValueError) as e:
-            raise TypeError(
-                "When input_shapes is a tuple or list of integers, every element must be int-like "
-                "(e.g. dimensions and -1 for the axis to maximize)."
-            ) from e
-        if -1 not in shape:
-            raise ValueError(
-                "tuple/list input_shapes must contain at least one -1 for the modifiable axis."
-            )
-        return "single", shape
+        if len(input_shapes) == 0:
+            raise ValueError("input_shapes tuple/list is empty.")
+        # List/tuple of per-tensor shapes: [(-1, 128, 512), (-1, 128, 512)] — not a flat (-1, …).
+        if isinstance(input_shapes[0], (tuple, list)):
+            parts: List[Tuple[str, Tuple[Any, ...]]] = []
+            for g in input_shapes:
+                if not isinstance(g, (tuple, list)):
+                    raise TypeError(
+                        "input_shapes: with multiple tensors, each element must be a tuple or list "
+                        "of dimensions, e.g. [(-1, 128, 512), (-1, 128, 512)]."
+                    )
+                parts.append(_parse_flat_shape_tuple(tuple(g)))
+            return "multi_shape", parts
+        return _parse_flat_shape_tuple(tuple(input_shapes))
     raise TypeError(
         f"input_shapes must be str (DSL), dict, or tuple/list of int/float; got {type(input_shapes)}"
     )
@@ -479,7 +523,7 @@ def find_max_minibatch(
     use_subprocess: Optional[bool] = None,
     *,
     forward_params: Optional[Sequence[str]] = None,
-) -> Optional[Union[int, Tuple[int, ...]]]:
+) -> Optional[Union[int, Tuple[int, ...], Tuple[Tuple[int, ...], ...]]]:
     """
     Find the maximum value for the modifiable axis that the model can process without OOM.
 
@@ -495,6 +539,11 @@ def find_max_minibatch(
        at least one ``-1`` (all ints), **or** a **compact numeric** tuple mixing ``int`` and
        negative ``float`` factors (e.g. ``(-1, 4, -1.5, 16)`` or ``(-1., 4, -1.3, 16)``): exactly one searched axis as int ``-1`` or float ``-1.``; other negative floats give size
        ``round(|f| * s)`` where ``s`` is the trial size on the searched axis.
+       Int-only shapes may also use integers ``d < -1`` (e.g. ``-2``) for ``round(|d| * s)``, same as negative floats.
+    3b. **List/tuple of shape tuples (several tensors):** e.g.
+       ``[(-1, 128, 512), (-1, 128, 512)]`` — one shape per ``forward`` tensor, same order as
+       ``forward_params`` / signature; each entry uses the same rules as (3). The searched
+       trial size is shared across every ``-1`` (and compact scaled dims) in all tensors.
     4. **axis_to_maximize + fixed_axis:** when ``input_shapes`` is omitted; for multi-input
        models (e.g. HuggingFace) by symbolic axis name.
 
@@ -527,8 +576,9 @@ def find_max_minibatch(
         max_growth_multiplier: Maximum single-step multiplicative increase after success (e.g. 6).
         cuda_mem_devices: CUDA indices for peak memory stats. ``None`` = ``device``'s index only;
             ``\"all\"`` or ``[0, 1, …]`` for multi-GPU bottleneck. Ignored when not on CUDA.
-        input_shapes: DSL string, dict (named shapes + ``#constraints``), tuple/list of ints
-            with ``-1``, or compact numeric tuple (ints + negative floats, see docstring).
+        input_shapes: DSL string, dict (named shapes + ``#constraints``), flat tuple/list of ints
+            or compact numeric tuple, or a **list/tuple of per-tensor shapes**
+            ``[(-1, 128, 512), …]`` (see docstring).
         use_subprocess: If ``True``, each attempt runs in a child (Linux/macOS). If ``False``,
             in-process. If ``None``, default is subprocess on **CUDA, CPU, and MPS** (worker
             may be OOM-killed without killing the parent). Set ``BATCH_FINDER_SUBPROCESS=0``
@@ -544,6 +594,8 @@ def find_max_minibatch(
         For int-only tuple/list ``input_shapes``: final shape tuple with each ``-1`` replaced
             by the max value.
         For compact numeric ``input_shapes``: final materialized shape tuple (ints only).
+        For **multi_shape** (list of per-tensor shapes): tuple of final shape tuples, one per
+            tensor (same order as ``forward``).
         For DSL string or ``axis_to_maximize``: int (max symbol or axis value).
         None if no value succeeded.
     """
@@ -630,12 +682,23 @@ def find_max_minibatch(
 
     use_single_shape = shape_mode == "single"
     use_compact_shape = shape_mode == "compact"
+    use_multi_shape = shape_mode == "multi_shape"
     single_shape: Optional[Tuple[int, ...]] = shape_payload if use_single_shape else None
     compact_spec: Optional[Tuple[Union[int, float], ...]] = (
         shape_payload if use_compact_shape else None
     )
+    multi_shape_parts: Optional[List[Tuple[str, Any]]] = (
+        shape_payload if use_multi_shape else None
+    )
     spec: Optional[InputShapesSpec] = None
     dtype_overrides: Optional[Dict[str, str]] = None
+
+    if use_multi_shape and multi_shape_parts is not None:
+        if len(multi_shape_parts) != len(inputs_info):
+            raise ValueError(
+                f"input_shapes lists {len(multi_shape_parts)} tensor shape(s); "
+                f"forward has {len(inputs_info)} tensor argument(s) after skips."
+            )
 
     if shape_mode == "dsl":
         assert shape_payload is not None
@@ -684,16 +747,19 @@ def find_max_minibatch(
                 f"search symbol {spec.search_symbol!r} must appear in at least one shape tuple."
             )
 
-    if not use_dsl and not use_single_shape and not use_compact_shape and not axis_to_maximize:
+    if (
+        not use_dsl
+        and not use_single_shape
+        and not use_compact_shape
+        and not use_multi_shape
+        and not axis_to_maximize
+    ):
         raise ValueError("Must provide input_shapes or axis_to_maximize.")
 
-    modifiable_axis_idxs = (
-        [i for i, s in enumerate(single_shape) if s == -1]
-        if (use_single_shape and single_shape)
-        else []
-    )
     shape_param_name = (
-        inputs_info[0][0] if (use_single_shape or use_compact_shape) else None
+        inputs_info[0][0]
+        if (use_single_shape or use_compact_shape or use_multi_shape)
+        else None
     )
 
     # Build sample axis_values for size estimation
@@ -702,11 +768,19 @@ def find_max_minibatch(
         _, binds = materialize_shapes(spec, initial_value, fixed_axis)
         _sample_axis_values.update(binds)
     elif use_single_shape and single_shape is not None:
-        _sample_shape = tuple(initial_value if s == -1 else s for s in single_shape)
+        _sample_shape = _materialize_int_shape_slots(single_shape, initial_value)
         _sample_axis_values["batch_size"] = _sample_shape[0] if _sample_shape else initial_value
         _sample_axis_values["seq_len"] = _sample_shape[1] if len(_sample_shape) > 1 else 64
     elif use_compact_shape and compact_spec is not None:
         _sample_shape = materialize_compact_numeric_shape(compact_spec, initial_value)
+        _sample_axis_values["batch_size"] = _sample_shape[0] if _sample_shape else initial_value
+        _sample_axis_values["seq_len"] = _sample_shape[1] if len(_sample_shape) > 1 else 64
+    elif use_multi_shape and multi_shape_parts is not None:
+        m0, p0 = multi_shape_parts[0]
+        if m0 == "single":
+            _sample_shape = _materialize_int_shape_slots(p0, initial_value)
+        else:
+            _sample_shape = materialize_compact_numeric_shape(p0, initial_value)
         _sample_axis_values["batch_size"] = _sample_shape[0] if _sample_shape else initial_value
         _sample_axis_values["seq_len"] = _sample_shape[1] if len(_sample_shape) > 1 else 64
     else:
@@ -718,10 +792,16 @@ def find_max_minibatch(
         if use_dsl and spec is not None:
             shapes_list, _ = materialize_shapes(spec, initial_value, fixed_axis)
             shape = shapes_list[idx]
+        elif use_multi_shape and multi_shape_parts is not None and idx < len(multi_shape_parts):
+            m_i, p_i = multi_shape_parts[idx]
+            if m_i == "single":
+                shape = _materialize_int_shape_slots(p_i, initial_value)
+            else:
+                shape = materialize_compact_numeric_shape(p_i, initial_value)
         elif use_compact_shape and idx == 0 and compact_spec is not None:
             shape = materialize_compact_numeric_shape(compact_spec, initial_value)
         elif use_single_shape and idx == 0 and single_shape is not None:
-            shape = tuple(initial_value if s == -1 else s for s in single_shape)
+            shape = _materialize_int_shape_slots(single_shape, initial_value)
         else:
             shape = _get_default_shape_for_param(name, _sample_axis_values, cfg_effective)
         tqdm.write(f"  {name}: {itype}, {shape}")
@@ -740,6 +820,23 @@ def find_max_minibatch(
                 if dtype == "integer":
                     vocab = getattr(cfg_effective, "vocab_size", None) or 50257
                     inputs[param_name] = torch.randint(0, min(vocab, 1000), shape, device=device, dtype=torch.long)
+                else:
+                    inputs[param_name] = torch.randn(
+                        shape, device=device, requires_grad=_float_requires_grad
+                    )
+        elif use_multi_shape and multi_shape_parts is not None:
+            for idx, (param_name, _) in enumerate(inputs_info):
+                mode_i, payload_i = multi_shape_parts[idx]
+                if mode_i == "single":
+                    shape = _materialize_int_shape_slots(payload_i, value)
+                else:
+                    shape = materialize_compact_numeric_shape(payload_i, value)
+                dtype = _infer_input_type(param_name, dtype_overrides)
+                if dtype == "integer":
+                    vocab = getattr(cfg_effective, "vocab_size", None) or 50257
+                    inputs[param_name] = torch.randint(
+                        0, min(vocab, 1000), shape, device=device, dtype=torch.long
+                    )
                 else:
                     inputs[param_name] = torch.randn(
                         shape, device=device, requires_grad=_float_requires_grad
@@ -766,10 +863,7 @@ def find_max_minibatch(
                         p_shape, device=device, requires_grad=_float_requires_grad
                     )
         elif use_single_shape and single_shape is not None:
-            shape = list(single_shape)
-            for idx in modifiable_axis_idxs:
-                shape[idx] = value
-            shape = tuple(shape)
+            shape = _materialize_int_shape_slots(single_shape, value)
             dtype = _infer_input_type(shape_param_name)
             if dtype == "integer":
                 vocab = getattr(cfg_effective, "vocab_size", None) or 50257
@@ -859,6 +953,8 @@ def find_max_minibatch(
 
     if use_dsl:
         desc_base = f"input_shapes search={spec.search_symbol if spec else '?'}"
+    elif use_multi_shape and multi_shape_parts is not None:
+        desc_base = f"input_shapes multi={multi_shape_parts!r}"
     elif use_compact_shape and compact_spec is not None:
         desc_base = f"input_shapes={compact_spec!r}"
     elif use_single_shape:
@@ -1111,12 +1207,22 @@ def find_max_minibatch(
 
     if successful:
         result = max(successful)
+        if use_multi_shape and multi_shape_parts is not None:
+            out_shapes: List[Tuple[int, ...]] = []
+            for mode_i, payload_i in multi_shape_parts:
+                if mode_i == "single":
+                    out_shapes.append(_materialize_int_shape_slots(payload_i, result))
+                else:
+                    out_shapes.append(materialize_compact_numeric_shape(payload_i, result))
+            final_tuple = tuple(out_shapes)
+            tqdm.write(f"\n✅ Final input shapes: {final_tuple}")
+            return final_tuple
         if use_compact_shape and compact_spec is not None:
             final_input_shape = materialize_compact_numeric_shape(compact_spec, result)
             tqdm.write(f"\n✅ Final input shape: {final_input_shape}")
             return final_input_shape
         if use_single_shape and single_shape is not None:
-            final_input_shape = tuple(result if s == -1 else s for s in single_shape)
+            final_input_shape = _materialize_int_shape_slots(single_shape, result)
             tqdm.write(f"\n✅ Final input shape: {final_input_shape}")
             return final_input_shape
         if use_dsl and spec is not None:
