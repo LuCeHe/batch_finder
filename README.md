@@ -44,7 +44,7 @@ pip install -e .
 
 Use **negative integers** `-1` on each axis you want to maximize (the search tries a single trial size each step). In an **all-integer** tuple, every `-1` position shares that same trial size. Use positive integers for fixed dimensions.
 
-If the tuple mixes integers and **negative floats**, you are in **compact numeric** mode: there must be **exactly one** integer `-1` (the searched axis). Any other dimension given as a **negative float** `-x` is sized as `round(|x| × trial)`, where `trial` is the current value on the `-1` axis—so `|x|` is the proportion you want between that axis and the searched axis (e.g. `-1.5` keeps that dim about 1.5× the trial size). Do not use `-1.0` for the search axis (use integer `-1`).
+If the tuple mixes integers and **negative floats**, you are in **compact numeric** mode: there must be **at least one** integer `-1` (the searched axis). Any other dimension given as a **negative float** `-x` is sized as `round(|x| × trial)`, where `trial` is the current value on the `-1` axis—so `|x|` is the proportion you want between that axis and the searched axis (e.g. `-1.5` keeps that dim about 1.5× the trial size).
 
 ```python
 from batch_finder import find_max_minibatch
@@ -85,7 +85,7 @@ print(f"Max batch size: {max_batch}")
 
 ### Several tensors: one string
 
-When `forward` takes **multiple tensors**, pass **`input_shapes` as text**: one `(…)` group per argument (same order as `forward`), short names for axes that must match, optional equations between names, and **exactly one** `name=-1` for the size you search.
+When `forward` takes **multiple tensors**, pass **`input_shapes` as text**: one `(…)` group per argument (same order as `forward`), short names for axes that must match, optional equations between names, and **at least one** `name=-1` for the size you search.
 
 
 
@@ -113,7 +113,6 @@ def get_model():
 max_b = find_max_minibatch(
     get_model,
     input_shapes="(23, b, t, 45),(b, t, 12), t=1.5b, b=-1",
-    forward_params=["x", "y"],
 )
 ```
 
