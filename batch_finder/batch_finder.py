@@ -43,7 +43,7 @@ def _normalize_input_shapes_arg(
         ("dsl", dsl_string) — parse with ``parse_input_shapes``.
         ("dict_dsl", dict) — parse with ``parse_input_shapes_dict`` after ``inputs_info`` is known.
         ("single", shape_tuple) — one tensor: tuple/list of ints with at least one ``-1``.
-        ("compact", spec_tuple) — one tensor: ints + negative floats (e.g. ``-1.5`` for ``1.5×`` search).
+        ("compact", spec_tuple) — one tensor: ints + negative floats; searched axis is ``-1`` (int) or ``-1.0`` / ``-1.`` (float); other negative floats scale (e.g. ``-1.5`` → ``1.5×`` trial).
     """
     if input_shapes is None:
         return None, None
@@ -473,8 +473,8 @@ def find_max_minibatch(
        constraints (e.g. ``\"t=2b, b=-1\"``). Clearer for models with many arguments.
     3. **Tuple or list (single tensor):** only the first ``forward`` argument; must include
        at least one ``-1`` (all ints), **or** a **compact numeric** tuple mixing ``int`` and
-       negative ``float`` factors (e.g. ``(-1, 4, -1.5, 16)`` means axis 2 has size
-       ``round(1.5 * s)`` where ``s`` is the searched size at ``-1``).
+       negative ``float`` factors (e.g. ``(-1, 4, -1.5, 16)`` or ``(-1., 4, -1.3, 16)``): exactly one searched axis as int ``-1`` or float ``-1.``; other negative floats give size
+       ``round(|f| * s)`` where ``s`` is the trial size on the searched axis.
     4. **axis_to_maximize + fixed_axis:** when ``input_shapes`` is omitted; for multi-input
        models (e.g. HuggingFace) by symbolic axis name.
 

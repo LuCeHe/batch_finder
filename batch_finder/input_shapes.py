@@ -319,6 +319,13 @@ def normalize_compact_numeric_tuple(spec: Tuple[Any, ...]) -> Tuple[Union[int, f
     return tuple(_coerce_compact_dim(x, i) for i, x in enumerate(spec))
 
 
+def _compact_dim_is_search_axis(d: Any) -> bool:
+    """``True`` for ``-1`` (int) or ``-1.0`` / ``-1.`` (float): the binary-searched axis."""
+    if isinstance(d, bool):
+        return False
+    return isinstance(d, numbers.Real) and d == -1
+
+
 def materialize_compact_numeric_shape(
     spec: Tuple[Union[int, float], ...],
     search_value: int,
@@ -326,22 +333,25 @@ def materialize_compact_numeric_shape(
     """
     Single-tensor **compact numeric** ``input_shapes`` tuple.
 
-    - ``int == -1``: the binary-searched axis (exactly one).
+    - ``-1`` (int) or ``-1.0`` / ``-1.`` (float): the binary-searched axis (exactly one).
     - ``int >= 0``: fixed size.
     - ``int < -1``: invalid (use string DSL for multi-symbol search).
-    - negative ``float`` ``d``: size ``round(abs(d) * search_value)`` (e.g. ``-1.5`` → ``1.5 * s``).
+    - other negative ``float`` ``d``: size ``round(abs(d) * search_value)`` (e.g. ``-1.5`` → ``1.5 * s``).
     """
-    n_search = sum(1 for d in spec if isinstance(d, int) and d == -1)
+    n_search = sum(1 for d in spec if _compact_dim_is_search_axis(d))
     if n_search != 1:
         raise ValueError(
-            "compact numeric input_shapes must contain exactly one integer -1 (the searched axis)."
+            "compact numeric input_shapes must contain exactly one searched axis: int -1 or "
+            "float -1.0 (-1.); other negative floats scale relative to that trial size."
         )
     out: List[int] = []
     for d in spec:
-        if isinstance(d, int):
-            if d == -1:
-                out.append(search_value)
-            elif d >= 0:
+        if isinstance(d, bool):
+            raise TypeError(f"dimension must be int or float, got {type(d)}")
+        if _compact_dim_is_search_axis(d):
+            out.append(search_value)
+        elif isinstance(d, int):
+            if d >= 0:
                 out.append(d)
             else:
                 raise ValueError(

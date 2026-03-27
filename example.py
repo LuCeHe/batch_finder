@@ -117,8 +117,8 @@ if __name__ == "__main__":
         )
         print(f"   Result: Final input shape = {res_1b}")
 
-        # 1c: (-1, b, -1, d) - maximize axes 0 and 2 (same value)
-        print("\n1c. SimpleModel input_shapes=(-1, 4, -1, 16)...")
+        # 1c: compact — float -1. as search axis, -1.3 scales another dim vs. trial
+        print("\n1c. SimpleModel input_shapes=(-1., 4, -1.3, 16)...")
         res_1c = find_max_minibatch(
             get_simple_model,
             input_shapes=(-1., 4, -1.3, 16),
