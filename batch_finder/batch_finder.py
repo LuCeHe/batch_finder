@@ -119,6 +119,9 @@ def _inputs_info_from_names(names: List[str]) -> List[Tuple[str, inspect.Paramet
 
 
 # HuggingFace-style ``forward`` kwargs that are not probed as separate tensor slots.
+# Optional encoder / cross-attn args (e.g. newer GPT2 ``ForCausalLM``) must not get dummy
+# tensors during probing—HF raises if they are set inconsistently. Use ``forward_params=``
+# for encoder–decoder models where these are real inputs.
 _SKIP_FORWARD_PARAMS = frozenset(
     {
         "return_dict",
@@ -137,6 +140,9 @@ _SKIP_FORWARD_PARAMS = frozenset(
         # Alternate to ``input_ids``; passing both often breaks HF models.
         "inputs_embeds",
         "decoder_inputs_embeds",
+        "encoder_hidden_states",
+        "encoder_attention_mask",
+        "logits_to_keep",
     }
 )
 
