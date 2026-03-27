@@ -1,15 +1,14 @@
-# 🔍 Batch Finder
+<h1 align="center">🔍 Batch Finder</h1>
 
+<p align="center"><strong>Find the maximum value for any dimension your PyTorch models can handle without running out of memory.</strong></p>
 
-
-**Find the maximum value for any dimension your PyTorch models can handle without running out of memory.**
+<p align="center">
+  <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.8+-blue.svg" alt="Python 3.8+"></a>
+  <a href="https://pytorch.org/"><img src="https://img.shields.io/badge/PyTorch-1.9+-orange.svg" alt="PyTorch"></a>
+  <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT"></a>
+</p>
 
 Batch Finder detects your model’s inputs (types and shapes), fixes the sizes you choose, and searches for the largest value that still fits in memory.
-
-
-[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
-[![PyTorch](https://img.shields.io/badge/PyTorch-1.9+-orange.svg)](https://pytorch.org/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 
 

@@ -88,7 +88,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     experiments_to_run = [
-        # 'simple',
+        'simple',
         'hf',
         # 'two_input',
     ]
