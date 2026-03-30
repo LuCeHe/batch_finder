@@ -19,6 +19,7 @@ Batch Finder detects your model’s inputs (types and shapes), fixes the sizes y
 - 📐 **Shapes** – Flat tuple/list or **list of tuples** per tensor (e.g. `[(-1, 128, 512), (-1, 128, 512)]`), text or dict when `forward` takes several tensors, or `axis_to_maximize` + `fixed_axis`
 - 🚀 **Inference or training** – With or without backward
 - ⚙️ **Tunable search** – `factor_down`, `factor_up`, `n_attempts`, `initial_value`
+- ⏱️ **Optional time budget** – `time_limit_seconds` caps wall-clock time for the search loop; when it expires, you get the **best successful batch so far** (or `None` if nothing passed yet). Omit it (`None`, default) for no time limit—only `n_attempts` and the usual stopping rules apply
 - 🛡️ **Safe runs** – Cleans up after failures; returns `None` if even size `1` fails
 - 📊 **Progress** – tqdm with status in the bar
 
