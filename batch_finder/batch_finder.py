@@ -523,6 +523,7 @@ def find_max_minibatch(
     use_subprocess: Optional[bool] = None,
     *,
     forward_params: Optional[Sequence[str]] = None,
+    time_limit_seconds: Optional[float] = None,
 ) -> Optional[Union[int, Tuple[int, ...], Tuple[Tuple[int, ...], ...]]]:
     """
     Find the maximum value for the modifiable axis that the model can process without OOM.
@@ -589,6 +590,12 @@ def find_max_minibatch(
             then if that is empty and you use ``axis_to_maximize`` only, defaults to
             :data:`DEFAULT_FORWARD_PARAMS_CAUSAL_LM`. Override when inference misses an argument
             or order does not match your DSL/tuple.
+        time_limit_seconds: If set, wall-clock limit **from the start of the search loop** (after
+            the config/signature probe). When time is up, returns the **best batch found so far**
+            (largest successful trial size) if any, else ``None``. Between attempts, sleeps are
+            shortened so the limit is respected. With ``use_subprocess=True``, a running worker is
+            **terminated** (``terminate`` / ``kill``) if it would exceed the remaining time.
+            In-process attempts are not interrupted mid-forward; the limit applies between attempts.
 
     Returns:
         For int-only tuple/list ``input_shapes``: final shape tuple with each ``-1`` replaced
@@ -597,8 +604,10 @@ def find_max_minibatch(
         For **multi_shape** (list of per-tensor shapes): tuple of final shape tuples, one per
             tensor (same order as ``forward``).
         For DSL string or ``axis_to_maximize``: int (max symbol or axis value).
-        None if no value succeeded.
+        None if no value succeeded (including when the time limit expires before any success).
     """
+    if time_limit_seconds is not None and float(time_limit_seconds) < 0:
+        raise ValueError("time_limit_seconds must be non-negative when set.")
     fixed_axis = fixed_axis or {}
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
     delay = _default_delay_for_device(device, delay)
@@ -981,8 +990,24 @@ def find_max_minibatch(
     # mp_ctx / mp_ok were computed before the config+signature probe (same subprocess default).
     first_subprocess_run = True
     _logged_subprocess_sigkill = False
+    search_t0 = time.monotonic()
+    time_limit_hit = False
+
+    def _remaining_seconds() -> Optional[float]:
+        if time_limit_seconds is None:
+            return None
+        return max(0.0, float(time_limit_seconds) - (time.monotonic() - search_t0))
+
     n_gpus = 0
     for i in pbar:
+        if time_limit_seconds is not None:
+            if (time.monotonic() - search_t0) >= float(time_limit_seconds):
+                time_limit_hit = True
+                if successful:
+                    tqdm.write("\n⏱ Time limit reached; returning best batch found so far.")
+                else:
+                    tqdm.write("\n⏱ Time limit reached; no successful trial yet.")
+                break
         value_i = max(1, current_value)
         ok = False
         err_msg_str: Optional[str] = None
@@ -1047,8 +1072,20 @@ def find_max_minibatch(
             proc = mp_ctx.Process(target=run_in_process, args=(result_queue, value_i, first_subprocess_run))
             try:
                 proc.start()
-                proc.join()
-                if proc.exitcode == 0:
+                rem_join = _remaining_seconds()
+                if rem_join is not None:
+                    proc.join(timeout=max(0.0, rem_join))
+                else:
+                    proc.join()
+                if proc.is_alive():
+                    proc.terminate()
+                    proc.join(timeout=15)
+                    if proc.is_alive():
+                        proc.kill()
+                        proc.join(timeout=10)
+                    err_msg_str = "time limit (worker terminated)"
+                    ok = False
+                elif proc.exitcode == 0:
                     try:
                         res = result_queue.get_nowait()
                     except queue.Empty:
@@ -1153,7 +1190,18 @@ def find_max_minibatch(
             pbar.set_postfix(**pf)
 
         _release_memory(device, cuda_devs, aggressive=not ok)
-        time.sleep(delay)
+        if time_limit_seconds is not None:
+            r_sleep = _remaining_seconds()
+            if r_sleep is not None and r_sleep <= 0:
+                time_limit_hit = True
+                if successful:
+                    tqdm.write("\n⏱ Time limit reached; returning best batch found so far.")
+                else:
+                    tqdm.write("\n⏱ Time limit reached; no successful trial yet.")
+                break
+            time.sleep(min(delay, r_sleep) if r_sleep is not None else delay)
+        else:
+            time.sleep(delay)
 
         t_ok = [ok]
 
