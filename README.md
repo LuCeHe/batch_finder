@@ -14,14 +14,14 @@ Batch Finder detects your model’s inputs (types and shapes), fixes the sizes y
 
 ## ✨ Features
 
-- 🎯 **One API** – `find_max_minibatch` for all workflows
-- 🔍 **Explicit inputs** – Names, dtypes, and rough shapes from `input_shapes` / `forward_params`, plus `get_model().config` when available
-- 📐 **Shapes** – Flat tuple/list or **list of tuples** per tensor (e.g. `[(-1, 128, 512), (-1, 128, 512)]`), text or dict when `forward` takes several tensors, or `axis_to_maximize` + `fixed_axis`
-- 🚀 **Inference or training** – With or without backward
-- ⚙️ **Tunable search** – `factor_down`, `factor_up`, `n_attempts`, `initial_value`
-- ⏱️ **Optional time budget** – `time_limit_seconds` caps wall-clock time for the search loop; when it expires, you get the **best successful batch so far** (or `None` if nothing passed yet). Omit it (`None`, default) for no time limit—only `n_attempts` and the usual stopping rules apply
-- 🛡️ **Safe runs** – Cleans up after failures; returns `None` if even size `1` fails
-- 📊 **Progress** – tqdm with status in the bar
+- 🎯 **One main function** – You call `find_max_minibatch` for pretty much everything you need here.
+- 🔍 **Tell it what goes in** – You pass names, data types, and rough shapes (`input_shapes` / `forward_params`). If your model has a `config`, that can help too.
+- 📐 **Shapes your way** – Use a simple tuple or list, or a **list of tuples** when you have multiple tensors (for example `[(-1, 128, 512), (-1, 128, 512)]`). For several inputs, you can use a text string or a dict. Or skip that and use `axis_to_maximize` plus `fixed_axis` (handy for Hugging Face–style models).
+- 🚀 **Runs forward or full training** – Turn backward on or off depending on what you want to test.
+- ⚙️ **Knobs you can turn** – Change how fast it steps up or down (`factor_up`, `factor_down`), how many tries it gets (`n_attempts`), and where it starts (`initial_value`).
+- ⏱️ **Time cap (optional)** – Set `time_limit_seconds` if you only want the search to run for so long. When time is up, you get the **best size that worked so far** (or `None` if nothing worked yet). Leave it unset to ignore the clock and rely on `n_attempts` and the normal stop rules.
+- 🛡️ **Fails without trashing your session** – When things blow up, it cleans up. If even batch size `1` fails, you get `None` (honest “no”).
+- 📊 **See what it’s doing** – `tqdm` shows a progress bar with useful status text.
 
 ## 📦 Installation
 
