@@ -248,7 +248,8 @@ batch_size fixed={'seq_len': 32}: 100%|█████████████�
 - **Defaults:** Omitting `initial_value` and `delay` picks smaller starts and shorter pauses on CPU/MPS than on CUDA.
 - **Login nodes:** Prefer a real GPU job for meaningful limits. On CPU-only hosts, use a smaller `initial_value` and/or `inference_only=True` if RAM is tight.
 - **Memory-guided steps:** After each good run, peak GPU memory vs total guides the next step (capped by `max_growth_multiplier`). Install `psutil` for a rough CPU hint. Set `memory_guided=False` to use only `factor_up` / `factor_down`.
-- **Multi-GPU:** Use `cuda_mem_devices="all"` or a list so every GPU is considered; the smallest safe step applies.
+- **Multi-GPU (one OS process):** Use `cuda_mem_devices="all"` or a list so every visible GPU is measured; memory-guided growth uses the tightest GPU (minimum headroom).
+- **DDP / torchrun / Accelerate (several processes):** Each rank runs the search on **its** assigned GPU (`cuda_mem_devices` default is that GPU only). Ranks can therefore converge to **different** batch sizes; training still needs **one** `per_device_train_batch_size` for all ranks. Either run the search on a single rank and broadcast (OK if GPUs are identical), or run on every rank and call ``_findbatch_sync_batch_across_ranks(max_shape, seq_len, output_dir)`` from this package to take the **minimum** batch across ``WORLD_SIZE`` (JSON files under ``output_dir``). The `thepebbletrail_official` `train.py` path with `findbatch` in `notes` uses that helper before training starts.
 - **Time limit:** Pass `time_limit_seconds=…` to cap wall-clock time for the **search loop** (after the one-time probe). You get the best batch found so far when the limit hits. Subprocess workers are stopped if they would run past the remaining budget; an in-process forward/backward still runs to completion once started.
 
 

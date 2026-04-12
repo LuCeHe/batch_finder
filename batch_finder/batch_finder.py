@@ -4,6 +4,7 @@ Batch Finder - Core functionality for finding maximum batch sizes along variable
 
 import gc
 import inspect
+import json
 import logging
 import numbers
 import os
@@ -15,7 +16,7 @@ import warnings
 import multiprocessing
 import threading
 from collections.abc import Mapping, Sequence
-from typing import Optional, Callable, Dict, Any, Tuple, List, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import torch
 from tqdm import tqdm
 
@@ -524,6 +525,7 @@ def find_max_minibatch(
     *,
     forward_params: Optional[Sequence[str]] = None,
     time_limit_seconds: Optional[float] = None,
+    distributed_sync_dir: Optional[str] = None,
 ) -> Optional[Union[int, Tuple[int, ...], Tuple[Tuple[int, ...], ...]]]:
     """
     Find the maximum value for the modifiable axis that the model can process without OOM.
