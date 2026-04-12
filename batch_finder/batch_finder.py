@@ -503,6 +503,14 @@ def _default_initial_value_for_device(device: torch.device, initial_value: Optio
     return 32
 
 
+def _default_distributed_sync_dir() -> str:
+    """Shared-ish cache dir for multi-rank JSON sync (HPC ``WORK``, else home)."""
+    work = os.environ.get("WORK", "").strip()
+    if work:
+        return os.path.join(work, ".cache")
+    return os.path.join(os.path.expanduser("~"), ".cache")
+
+
 def find_max_minibatch(
     get_model: Callable[[], torch.nn.Module],
     axis_to_maximize: Optional[str] = None,
@@ -598,6 +606,12 @@ def find_max_minibatch(
             shortened so the limit is respected. With ``use_subprocess=True``, a running worker is
             **terminated** (``terminate`` / ``kill``) if it would exceed the remaining time.
             In-process attempts are not interrupted mid-forward; the limit applies between attempts.
+        distributed_sync_dir: Used only when ``WORLD_SIZE > 1`` (e.g. ``torchrun``, Accelerate).
+            Each rank may finish with a different best **trial size**; before returning, the
+            function takes the **minimum** across ranks via JSON files so every process agrees
+            on the same limit for DDP. The directory must be on **shared** storage visible to
+            all ranks. Default: environment variable ``BATCH_FINDER_SYNC_DIR`` if set, otherwise
+            ``$WORK/.cache`` when ``WORK`` is set, else ``$HOME/.cache`` (via ``os.path.expanduser("~")``).
 
     Returns:
         For int-only tuple/list ``input_shapes``: final shape tuple with each ``-1`` replaced
@@ -1257,6 +1271,72 @@ def find_max_minibatch(
 
     if successful:
         result = max(successful)
+        _world = int(os.environ.get("WORLD_SIZE", "1"))
+        if _world > 1:
+            _rank = int(os.environ.get("RANK", "0"))
+            _sync_dir = (
+                distributed_sync_dir
+                or os.environ.get("BATCH_FINDER_SYNC_DIR")
+                or _default_distributed_sync_dir()
+            )
+            os.makedirs(_sync_dir, exist_ok=True)
+
+            def _atomic_write_json(path: str, obj: Any) -> None:
+                tmp = path + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(obj, f)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp, path)
+
+            _per_path = os.path.join(_sync_dir, f"_findbatch_rank_{_rank}.json")
+            _atomic_write_json(_per_path, {"trial": int(result)})
+            _agreed_path = os.path.join(_sync_dir, "_findbatch_agreed.json")
+            if _rank == 0:
+                for _ in range(7200):
+                    if all(
+                        os.path.exists(os.path.join(_sync_dir, f"_findbatch_rank_{r}.json"))
+                        for r in range(_world)
+                    ):
+                        trials: List[int] = []
+                        for r in range(_world):
+                            with open(
+                                os.path.join(_sync_dir, f"_findbatch_rank_{r}.json"),
+                                encoding="utf-8",
+                            ) as f:
+                                row = json.load(f)
+                            t = row.get("trial")
+                            if t is None:
+                                raise RuntimeError(
+                                    f"find_max_minibatch had no successful trial on rank {r}; "
+                                    "cannot agree for DDP."
+                                )
+                            trials.append(int(t))
+                        agreed = min(trials)
+                        _atomic_write_json(
+                            _agreed_path, {"trial": agreed, "per_rank_trials": trials}
+                        )
+                        break
+                    time.sleep(0.5)
+                else:
+                    raise RuntimeError(
+                        "Timeout waiting for all ranks to finish find_max_minibatch (file sync)."
+                    )
+            else:
+                for _ in range(7200):
+                    if os.path.exists(_agreed_path):
+                        break
+                    time.sleep(0.5)
+                else:
+                    raise RuntimeError(
+                        "Timeout waiting for rank 0 find_max_minibatch agreement file."
+                    )
+            with open(_agreed_path, encoding="utf-8") as f:
+                result = int(json.load(f)["trial"])
+            tqdm.write(
+                f"\nMulti-rank (WORLD_SIZE={_world}): agreed trial size {result} "
+                f"(min across ranks; sync dir={_sync_dir!r})."
+            )
         if use_multi_shape and multi_shape_parts is not None:
             out_shapes: List[Tuple[int, ...]] = []
             for mode_i, payload_i in multi_shape_parts:

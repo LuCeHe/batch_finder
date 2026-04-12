@@ -5,11 +5,7 @@ A utility package to help you determine the maximum batch size, number of docume
 and sequence length (timesteps) that your model can handle without running out of memory.
 """
 
-from .batch_finder import (
-    DEFAULT_FORWARD_PARAMS_CAUSAL_LM,
-    _findbatch_sync_batch_across_ranks,
-    find_max_minibatch,
-)
+from .batch_finder import DEFAULT_FORWARD_PARAMS_CAUSAL_LM, find_max_minibatch
 from .input_shapes import (
     CONSTRAINTS_KEY,
     FINDER_CONSTRAINTS_KEY,
@@ -24,7 +20,6 @@ from .input_shapes import (
 __version__ = "0.1.0"
 __all__ = [
     "DEFAULT_FORWARD_PARAMS_CAUSAL_LM",
-    "_findbatch_sync_batch_across_ranks",
     "find_max_minibatch",
     "parse_input_shapes",
     "parse_input_shapes_dict",
