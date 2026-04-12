@@ -485,6 +485,19 @@ def _default_distributed_sync_dir() -> str:
     return os.path.join(os.path.expanduser("~"), ".cache")
 
 
+def _distributed_sync_job_tag() -> str:
+    """Subdirectory name shared by all ranks in one launcher job (isolates stale sync JSON)."""
+    for key in ("SLURM_JOB_ID", "LSB_JOBID", "PBS_JOBID", "TORCHELASTIC_RUN_ID"):
+        v = os.environ.get(key, "").strip()
+        if v:
+            return v
+    ma = os.environ.get("MASTER_ADDR", "").strip()
+    mp = os.environ.get("MASTER_PORT", "").strip()
+    if ma and mp:
+        return f"{ma}_{mp}".replace(os.sep, "_").replace(":", "_")
+    return "default"
+
+
 def find_max_minibatch(
     get_model: Callable[[], torch.nn.Module],
     axis_to_maximize: Optional[str] = None,
@@ -587,6 +600,9 @@ def find_max_minibatch(
             on the same limit for DDP. The directory must be on **shared** storage visible to
             all ranks. Default: environment variable ``BATCH_FINDER_SYNC_DIR`` if set, otherwise
             ``$WORK/.cache`` when ``WORK`` is set, else ``$HOME/.cache`` (via ``os.path.expanduser("~")``).
+            Files are written under ``…/find_max_minibatch_sync/<job_tag>/`` where ``job_tag`` comes
+            from ``SLURM_JOB_ID`` / ``MASTER_ADDR``+``MASTER_PORT`` / etc., so runs do not read stale
+            ``_findbatch_agreed.json`` from an older job in the same cache tree.
 
     Returns:
         For int-only tuple/list ``input_shapes``: final shape tuple with each ``-1`` replaced
@@ -1242,10 +1258,13 @@ def find_max_minibatch(
         _world = int(os.environ.get("WORLD_SIZE", "1"))
         if _world > 1:
             _rank = int(os.environ.get("RANK", "0"))
-            _sync_dir = (
+            _sync_base = (
                 distributed_sync_dir
                 or os.environ.get("BATCH_FINDER_SYNC_DIR")
                 or _default_distributed_sync_dir()
+            )
+            _sync_dir = os.path.join(
+                _sync_base, "find_max_minibatch_sync", _distributed_sync_job_tag()
             )
             os.makedirs(_sync_dir, exist_ok=True)
 
@@ -1261,11 +1280,27 @@ def find_max_minibatch(
             _atomic_write_json(_per_path, {"trial": int(result)})
             _agreed_path = os.path.join(_sync_dir, "_findbatch_agreed.json")
             if _rank == 0:
+                try:
+                    if os.path.exists(_agreed_path):
+                        os.remove(_agreed_path)
+                except OSError:
+                    pass
+                tqdm.write(
+                    f"\nbatch_finder: rank 0 finished search (best trial {result}); "
+                    f"waiting for {_world} ranks to publish sync files under {_sync_dir!r} "
+                    "(other ranks may still be probing — this is not a hang)."
+                )
+                _wait_t0 = time.monotonic()
+                _last_msg = _wait_t0
                 for _ in range(7200):
-                    if all(
-                        os.path.exists(os.path.join(_sync_dir, f"_findbatch_rank_{r}.json"))
+                    missing = [
+                        r
                         for r in range(_world)
-                    ):
+                        if not os.path.exists(
+                            os.path.join(_sync_dir, f"_findbatch_rank_{r}.json")
+                        )
+                    ]
+                    if not missing:
                         trials: List[int] = []
                         for r in range(_world):
                             with open(
@@ -1285,15 +1320,43 @@ def find_max_minibatch(
                             _agreed_path, {"trial": agreed, "per_rank_trials": trials}
                         )
                         break
+                    now = time.monotonic()
+                    if now - _last_msg >= 30.0:
+                        tqdm.write(
+                            f"batch_finder: rank 0 still waiting ({now - _wait_t0:.0f}s) for "
+                            f"rank file(s) {missing}."
+                        )
+                        _last_msg = now
                     time.sleep(0.5)
                 else:
                     raise RuntimeError(
                         "Timeout waiting for all ranks to finish find_max_minibatch (file sync)."
                     )
             else:
+                tqdm.write(
+                    f"\nbatch_finder: rank {_rank} finished search (best trial {result}); "
+                    f"waiting for rank 0 to publish min trial under {_sync_dir!r} …"
+                )
+                try:
+                    _rank_mtime = os.path.getmtime(_per_path)
+                except OSError:
+                    _rank_mtime = 0.0
+                _wait_t0 = time.monotonic()
+                _last_msg = _wait_t0
                 for _ in range(7200):
                     if os.path.exists(_agreed_path):
-                        break
+                        try:
+                            if os.path.getmtime(_agreed_path) >= _rank_mtime:
+                                break
+                        except OSError:
+                            break
+                    now = time.monotonic()
+                    if now - _last_msg >= 30.0:
+                        tqdm.write(
+                            f"batch_finder: rank {_rank} still waiting ({now - _wait_t0:.0f}s) "
+                            "for rank 0 to write _findbatch_agreed.json (rank 0 may still be searching)."
+                        )
+                        _last_msg = now
                     time.sleep(0.5)
                 else:
                     raise RuntimeError(
