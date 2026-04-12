@@ -442,32 +442,6 @@ def _memory_guided_success_multiplier(
     return min(min(candidates), max_multiplier)
 
 
-def _interpolated_bracket_guess(
-    max_ok: int,
-    min_fail: int,
-    peaks_at_max: Dict[int, int],
-    target_fraction: float,
-    max_multiplier: float,
-) -> Optional[int]:
-    """VRAM linear extrapolation from per-GPU peaks at max_ok; None → use plain mid."""
-    if min_fail <= max_ok + 1 or not peaks_at_max:
-        return None
-    if not torch.cuda.is_available():
-        return None
-    # Interpolation: allow large implied mult inside bracket (cap separately)
-    m = _cuda_multiplier_from_peaks(peaks_at_max, target_fraction, max_multiplier=1e9)
-    if m is None:
-        return None
-    try:
-        v_est = int(max_ok * min(m, max_multiplier))
-        v_est = max(max_ok + 1, min(v_est, min_fail - 1))
-        if max_ok < v_est < min_fail:
-            return v_est
-    except Exception:
-        pass
-    return None
-
-
 def _release_memory(device: torch.device, cuda_devs: List[int], aggressive: bool = False) -> None:
     """Free allocator memory after a failed attempt (OOM paths)."""
     if aggressive:
@@ -560,9 +534,10 @@ def find_max_minibatch(
 
     Search strategy: by default **memory-guided** on success (GPU peak VRAM vs device total,
     optional CPU via RSS + psutil), capped by ``max_growth_multiplier`` (e.g. jump toward
-    ~6× in one step when headroom allows). On failure, divide by ``factor_down``; when both
-    a success and a failure bracket the answer, uses VRAM linear extrapolation when possible,
-    else bisection. Set ``memory_guided=False`` to use only ``factor_up`` / ``factor_down``.
+    ~6× in one step when headroom allows). On failure outside a bracket, divide by
+    ``factor_down``. When a success and a failure bracket the optimum, the next trial is always
+    the integer midpoint ``(max_ok + min_fail) // 2`` (binary search). Set ``memory_guided=False``
+    to use only ``factor_up`` / ``factor_down`` after successes.
 
     Args:
         get_model: Callable returning a fresh ``nn.Module`` per attempt (or per subprocess).
@@ -1230,14 +1205,7 @@ def find_max_minibatch(
         if max_ok is not None and min_fail is not None:
             if min_fail <= max_ok + 1:
                 break
-            if memory_guided:
-                peak_at_max = success_peak_gpu_by_value.get(max_ok, {})
-                guess = _interpolated_bracket_guess(
-                    max_ok, min_fail, peak_at_max, tgt_frac, max_mult
-                )
-                current_value = guess if guess is not None else (max_ok + min_fail) // 2
-            else:
-                current_value = (max_ok + min_fail) // 2
+            current_value = (max_ok + min_fail) // 2
         elif t_ok and t_ok[0]:
             if memory_guided:
                 mult = _memory_guided_success_multiplier(

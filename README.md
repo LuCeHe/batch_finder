@@ -234,7 +234,7 @@ batch_size fixed={'seq_len': 32}: 100%|█████████████�
 1. **Inputs** – Uses `input_shapes` dict keys or `forward_params` (no live module in the parent during the search).
 2. **Types** – Integers for `*ids`, `*mask`, `labels`; floats otherwise.
 3. **Shapes** – From optional `config`, or from `get_model().config` (one probe if you omit `config`) plus argument names.
-4. **Search** – On success, grow; on failure, shrink. Stops at failure at size `1`, when `n_attempts` is reached, or when **`time_limit_seconds`** elapses (then returns the best successful trial so far, if any).
+4. **Search** – On success, grow (memory-guided or `factor_up`); on failure without a bracket, shrink by `factor_down`. Once a success and a failure bracket the limit, the next trial is always the **midpoint** `(max_ok + min_fail) // 2` until the bracket tightens to one step. Stops at failure at size `1`, when `n_attempts` is reached, or when **`time_limit_seconds`** elapses (then returns the best successful trial so far, if any).
 5. **Loss** – Uses `output.loss` if present, otherwise sums output tensors.
 
 
